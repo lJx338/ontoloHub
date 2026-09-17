@@ -119,6 +119,10 @@ from src.api.sources import ev_router, prof_router
 app.include_router(ev_router)
 app.include_router(prof_router)
 
+# HIA-59: 对象与链接运行时 API
+from src.api import objects
+app.include_router(objects.router)
+
 # 发布与交付路由
 from src.api.release import router as release_router, cr_router as change_request_router
 app.include_router(release_router)
@@ -141,6 +145,8 @@ async def api_root() -> dict:
             "validation": "/validation",
             "evidences": "/evidences",
             "profiling": "/profiling",
+            "objects": "/objects/projects/{id}/objects",
+            "links": "/objects/projects/{id}/links",
             "releases": "/releases",
             "change_requests": "/change-requests",
             "deployments": "/deployments",

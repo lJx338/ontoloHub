@@ -148,6 +148,10 @@ class Link(Base, UUIDMixin, TimestampMixin, ProjectMixin):
         String(500), nullable=True
     )
 
+    identity_key: Mapped[Optional[str]] = mapped_column(
+        String(500), nullable=True, index=True
+    )
+
     properties: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     confidence: Mapped[float] = mapped_column(default=1.0)
