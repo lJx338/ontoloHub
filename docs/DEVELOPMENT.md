@@ -436,6 +436,88 @@ index 顺序、CHECK 约束名等），autogenerate 会忠实地把它们全 dum
 - 如果 diff 大到没法审，宁可手写迁移：加列就是 `op.add_column(...)` + index，
 别让 autogenerate 全包。
 
+### 6.20 字符串归一化时驼峰拆分必须在 `lower()` 之前
+
+**症状**：`_normalize_key("userEmail")` 返回 `"useremail"` 而不是 `"user_email"`，
+同义词表 / 字段名匹配全 miss。原本测试期望 "userEmail" → "user_email"。
+
+**原因**：驼峰正则是 `([a-z])([A-Z])`，要求小写字母后面跟大写字母。如果先
+`name.strip().lower()` 再 `re.sub(r"([a-z])([A-Z])", ...)`，所有大写都没了，正则
+**永远不匹配**，驼峰边界完全识别不到。
+
+**规避**：处理字段名 / 列名归一化时，统一用这个顺序：
+
+```python
+# 1. 先拆驼峰（在大小写都还在的时候）
+s = re.sub(r"([a-z])([A-Z])", r"\1_\2", name.strip())
+# 2. 再统一分隔符（下划线 / 连字符）
+s = re.sub(r"[_\-]+", "_", s)
+# 3. 最后才 lower
+return s.lower().strip("_")
+```
+
+`^[A-Z]+([A-Z][a-z])` 这类"连续大写后接小写"（如 `HTTPRequest` → `HTTP_Request`）也是
+常见变体，如果业务里碰到可加 `r"([A-Z]+)([A-Z][a-z])"`。本仓目前只用 snake / camel /
+kebab 三种，`re.sub(r"([a-z])([A-Z])", r"\1_\2", s)` 足够。
+
+### 6.21 创建 ORM 对象后立刻用它做副作用 → 必须先 `flush()`
+
+**症状**：路由 handler 里先 `decision = ReviewDecision(...)` 再执行一段后续逻辑
+（写审计事件 / 更新其他表的 `confirmed_by`），后续逻辑里用 `decision.decided_by` /
+`decision.created_at`，报 `NameError: name 'decision' is not defined`（变量在
+else 分支后面才创建）或 `MissingGreenlet: ... lazy load ...`（flush 后属性过期）。
+
+**原因**（两个独立 bug 都会撞）：
+
+1. 变量作用域：代码块在变量定义**之前**就引用了它 — 顺序写反了。
+2. ORM 默认 expire：仅 `session.add(obj)` 不 `flush()`，访问 `obj.id` /
+   `obj.created_at` 会触发 lazy load，async session 里就是 `MissingGreenlet`。
+
+**规避**：写"创建 A → 用 A 的字段做副作用"这种模式时，严格按这个顺序：
+
+```python
+# 1. 构造 ORM 对象
+decision = ReviewDecision(
+    proposal_id=proposal_id,
+    decided_by=uuid.uuid4(),
+    ...
+)
+session.add(decision)
+# 2. 先 flush，让 DB 生成 id / created_at 填充到对象
+await session.flush()
+# 3. 这下 decision.id / decision.decided_by / decision.created_at 都可用
+audit = AuditEvent(
+    actor_id=decision.decided_by,
+    ...
+    target_id=str(decision.id),
+    created_at=decision.created_at,
+)
+session.add(audit)
+# 4. 临近返回前再 flush + refresh（可选）
+await session.flush()
+await session.refresh(decision)
+```
+
+**反向陷阱**：如果副作用链是 A → B（修改 B 引用 A），又 B → C，则中途失败要
+回滚时，要把 A 也回滚；用 `Depends(get_session)` 走 FastAPI 默认事务边界就行，
+handler `raise HTTPException` 会自动 rollback。不要自己 `async with session.begin()`
+包一层 — 跟 `record_audit` 的二级 flush 兼容不好。
+
+### 6.22 测试方法引用模块级 import 的 helper 时也要先 import
+
+**症状**：在 `tests/test_xxx.py` 里的测试类 `TestXxx.test_yyy` 写
+`from src.services.foo import _helper` 后，`test_zzz` 里直接 `assert _helper(...)` 报
+`NameError: name '_helper' is not defined`。
+
+**原因**：每次 test 方法内部的 import 只在该 method 作用域里生效，不会冒泡
+到 test class 其它方法里。不 import 就用 → NameError。
+
+**规避**：
+
+- 模块顶部一次性 `from src.services.foo import _helper`（**推荐**，清晰且省时间）。
+- 或每个用到的 test 方法里都加一行 `from src.services.foo import _helper`。
+- 别抄 "前面那个测试里有 import 了" 的代码 — 那份 import 只对那个 method 有效。
+
 ---
 
 ## 7. 工具链 / 环境陷阱
