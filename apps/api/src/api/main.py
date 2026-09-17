@@ -1,4 +1,5 @@
 """FastAPI 应用入口"""
+import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -6,6 +7,11 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from src.core.cache import (
+    get_cache,
+    ping_cache_loop,
+    reset_cache,
+)
 from src.core.config import settings
 from src.db.connection import init_db, close_db
 from src.api.auth import ensure_bootstrap_admin
@@ -24,8 +30,36 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logging.getLogger(__name__).warning(
             "bootstrap admin failed: %s", exc
         )
+    # 启动 Redis 缓存（HIA-64）。连不上不阻断启动，只记日志。
+    try:
+        cache = await get_cache()
+        healthy = await cache.ping()
+        if not healthy:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Redis cache unavailable at startup; running in degraded mode"
+            )
+    except Exception as exc:  # pragma: no cover
+        import logging
+        logging.getLogger(__name__).warning(
+            "cache init failed (continuing without cache): %s", exc
+        )
+
+    # 后台循环：每 30s 探一次 Redis 健康
+    stop_event = asyncio.Event()
+    ping_task = asyncio.create_task(ping_cache_loop(stop_event, interval=30.0))
+    app.state.cache_ping_stop = stop_event
+    app.state.cache_ping_task = ping_task
+
     yield
+
     # 关闭
+    stop_event.set()
+    try:
+        await asyncio.wait_for(ping_task, timeout=2.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+    await reset_cache()
     await close_db()
 
 
@@ -75,10 +109,27 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 # 健康检查
 @app.get("/health")
 async def health_check() -> dict:
-    """健康检查"""
+    """健康检查 — 报告 DB / Redis 健康状态（HIA-64）。"""
+    from src.core.cache import get_cache, CacheUnavailable
+
+    redis_ok: bool = False
+    redis_error: str | None = None
+    try:
+        cache = await get_cache()
+        redis_ok = await cache.ping()
+    except CacheUnavailable as e:
+        redis_error = str(e)
+    except Exception as e:  # pragma: no cover - 兜底
+        redis_error = f"{type(e).__name__}: {e}"
+
     return {
         "status": "healthy",
         "version": settings.api.version,
+        "redis": {
+            "enabled": settings.redis.enabled,
+            "healthy": redis_ok,
+            "error": redis_error,
+        },
     }
 
 

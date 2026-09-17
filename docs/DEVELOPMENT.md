@@ -337,6 +337,36 @@ SoftDeleteMixin` 继承，按需显式定义自己的 `description` / `created_b
 **规避**：CSV snapshot 全量读入后用 Python list 切片（`rows[offset:offset+limit]`），
 不要在迭代中途做 break 判断。`truncated = total > len(rows)`。
 
+### 6.14 Redis 缓存失败时不应让请求整体失败
+
+**症状**：Redis 重启 / 网络抖动时，本来能 200 的端点开始返 500。
+
+**原因**：缓存层 `RedisError` 直接冒泡到路由层；上游不知道降级。
+
+**规避**：
+
+```python
+try:
+    cached = await cache.get_json("mapping", key)
+except CacheUnavailable:
+    cached = None  # 业务继续
+```
+
+`src.core.cache.CacheUnavailable` 是统一的「降级信号」。**所有写缓存的代码都
+要 try/except**，不要让缓存故障级联到上游。读取也要 catch — 否则瞬时网络
+抖动就能让正常请求失败。
+
+### 6.15 测试里直接构造 `Cache` 实例时要重置全局单例
+
+**症状**：上一个测试的单例连接池泄露到下一个测试，连接耗尽。
+
+**原因**：`get_cache()` 用 ``global _cache`` 单例；测试如果直接 ``Cache(cfg)`` 操作
+而不 ``reset_cache()``，下次 ``get_cache()`` 仍返回旧实例。
+
+**规避**：fixture 必须成对 — setup 时 ``await cache_mod.reset_cache()``，teardown
+再 ``await cache_mod.reset_cache()``。monkeypatch `_build_pool` 时尤其重要，
+否则 fake 客户端永远装不到单例上。
+
 ---
 
 ## 7. 工具链 / 环境陷阱
@@ -378,6 +408,8 @@ SoftDeleteMixin` 继承，按需显式定义自己的 `description` / `created_b
 - [ ] 没有 hard-coded URL / 端口 / 密钥？
 - [ ] 新增的 connector 类型写了单元测试？测试了 offset/limit 截断吗？
 - [ ] Connector config 的 `secret_fields` 字段在落盘前加密了吗？测试验证 DB 里是密文吗？
+- [ ] 新加 Redis 缓存的代码有 `try/except CacheUnavailable` 降级路径吗？
+- [ ] Redis 测试用 fakeredis，没连真 Redis？
 - [ ] 没把 `datetime.utcnow()` / `func.now()` 用在审计时间上？
 - [ ] 没把 ORM 实例直接当 Pydantic 返回？
 - [ ] 改动没破坏 §1–§5 任何一条？
@@ -442,7 +474,94 @@ cfg = decrypt_secret_fields(conn.config, conn.secret_fields)
 Connector API 遵循 `project_id` 放 **Query 参数**的模式（与其他 Sources/Evidence 路由一致），
 所以用 `require_role_query`。
 
-## 10. 文档维护
+## 10. Redis 缓存（HIA-64 B1）
+
+### 10.1 模块
+
+`src.core.cache` 提供全局 `Cache` 单例：
+
+- `await get_cache()` — 懒加载，连接池内置。
+- `await cache.ping()` — 检查健康状态，失败不抛。
+- `await cache.set(ns, key, value, ttl=60)` / `await cache.get(ns, key)` — 字符串读写。
+- `await cache.set_json(ns, key, obj, ttl=60)` / `await cache.get_json(ns, key)` — JSON 包装。
+- `await cache.incr(ns, key, ttl=60)` — 用于限流计数。
+- `await cache.delete(ns, key)` — 删除。
+- `await cache.aclose()` — 关闭连接池（lifespan 关闭时调用）。
+
+所有 key 自动拼成 `<key_prefix>:<namespace>:<key>`，多服务共用 Redis 时不串。
+
+### 10.2 不可用时不阻断
+
+Redis 连不上 / 鉴权失败时 `Cache` 进入「degraded」模式：
+
+- `get` / `set` / `incr` / `delete` 抛 `CacheUnavailable` — 调用方必须 try/except 降级。
+- `ping()` 返回 `False` 不抛。
+- `is_healthy` 属性始终反映最近一次 ping 结果。
+
+启动时若 ping 失败，应用继续运行（记 WARNING），业务逻辑 fallback 到「无缓存」。
+**不要**因为 Redis 故障把整条请求打 500。
+
+```python
+from src.core.cache import get_cache, CacheUnavailable
+
+cache = await get_cache()
+try:
+    cached = await cache.get_json("mapping", key)
+    if cached is not None:
+        return cached
+except CacheUnavailable:
+    pass  # Redis 挂了 — 直接走原始计算路径
+
+result = await compute_mapping(...)
+try:
+    await cache.set_json("mapping", key, result, ttl=300)
+except CacheUnavailable:
+    pass
+return result
+```
+
+### 10.3 测试模式
+
+不要让测试连真 Redis。monkeypatch `Cache._build_pool` 让其返回 `fakeredis.FakeRedis`：
+
+```python
+import fakeredis.aioredis as fakeredis_aioredis
+from src.core import cache as cache_mod
+from src.core.cache import Cache
+
+@pytest_asyncio.fixture
+async def fake_cache(monkeypatch):
+    fake_client = fakeredis_aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(Cache, "_build_pool", lambda self: setattr(self, "_client", fake_client))
+    await cache_mod.reset_cache()
+    yield fake_client
+    await cache_mod.reset_cache()
+```
+
+### 10.4 命名规范
+
+`namespace` 用业务名，如：
+
+- `mapping:<project_id>:<mapping_version_id>` — 映射缓存
+- `shacl:<project_id>:<ontology_version_id>` — SHACL 报告缓存
+- `rate:<user_id>:<endpoint>` — 限流计数
+- `idempotency:<key>` — 幂等键
+
+**不要**把 `project_id` 当 namespace 单独抽出来；多服务共用 Redis 时可能撞前缀。
+
+### 10.5 配置
+
+`.env` / 容器环境变量：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis 连接 URL |
+| `REDIS_ENABLED` | `true` | 设 `false` 强制降级（用于本地不启 Redis） |
+| `REDIS_SOCKET_TIMEOUT` | `2.0` | 读写 socket 超时（秒） |
+| `REDIS_CONNECT_TIMEOUT` | `2.0` | 连接握手超时（秒） |
+| `REDIS_KEY_PREFIX` | `ontolohub` | 全局前缀，多服务防串 |
+
+## 11. 文档维护
 
 - 这份文件本身有错、或遇到新坑没写进来 → **直接改**；不要在 PR 评论里口头说。
 - 改了约定但没更新本文件 → 评审时会被打回。

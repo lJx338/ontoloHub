@@ -7,6 +7,7 @@
 #
 # 服务：
 #   - postgres: PostgreSQL 16 主库
+#   - redis:    Redis 7 缓存（M1 起；候选/映射/SHACL 报告/限流）
 #   - api:      FastAPI 后端，自动跑 Alembic 迁移
 
 services:
@@ -28,6 +29,26 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    # HIA-64 B1 — 缓存 / 限流 / 幂等键
+    image: redis:7-alpine
+    container_name: ontolohub-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   api:
     build:
       context: .
@@ -37,9 +58,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/ontolohub
       DATABASE_ECHO: "false"
+      REDIS_URL: redis://redis:6379/0
+      REDIS_ENABLED: "true"
       API_HOST: 0.0.0.0
       API_PORT: "8000"
       API_DEBUG: "false"
@@ -56,3 +81,5 @@ services:
 volumes:
   postgres_data:
     name: ontolohub_postgres_data
+  redis_data:
+    name: ontolohub_redis_data

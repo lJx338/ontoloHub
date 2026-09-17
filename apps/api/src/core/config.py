@@ -140,6 +140,28 @@ class LogSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="LOG_")
 
 
+class RedisSettings(BaseSettings):
+    """Redis 配置（HIA-64 B1 — 多用户基础设施）。
+
+    M1 起引入，用于候选/映射/SHACL 报告缓存、限流、审计幂等键。
+    Redis 不可用时不阻断启动 — 见 :mod:`src.core.cache` 的 ``Cache`` 类。
+    """
+    url: str = Field(default="redis://localhost:6379/0")
+    enabled: bool = Field(default=True)
+    socket_timeout: float = Field(default=2.0, gt=0, le=30)
+    connect_timeout: float = Field(default=2.0, gt=0, le=30)
+    healthcheck_interval_s: int = Field(default=30, ge=1, le=600)
+    # 默认 key 前缀，避免多服务共用 Redis 时串 key
+    key_prefix: str = Field(default="ontolohub")
+
+    model_config = SettingsConfigDict(
+        env_prefix="REDIS_",
+        env_file=_DEFAULT_ENV_FILE,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
 class Settings(BaseSettings):
     """全局配置"""
     # 优先从仓库根目录的 .env 读取，这样 alembic 在 apps/api/ 子目录跑也能加载。
@@ -166,6 +188,7 @@ class Settings(BaseSettings):
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     upload: UploadSettings = Field(default_factory=UploadSettings)
     log: LogSettings = Field(default_factory=LogSettings)
+    redis: RedisSettings = Field(default_factory=RedisSettings)
 
     def model_post_init(self, __context: object) -> None:
         # 把 SQLite 相对路径钉到仓库根

@@ -30,3 +30,8 @@ typer>=0.12.0
 
 # ===== Connector framework secrets (HIA-71) =====
 cryptography>=42.0.0  # Fernet 对称加密，用于连接器 config.secret_fields
+
+# ===== Cache / Session store (HIA-64) =====
+# M1 起引入：候选/映射缓存、SHACL 报告缓存、限流与会话。
+# 不强制启动 — 没 Redis 时降级为「无缓存」模式（HIA-64 退出条件）。
+redis[hiredis]>=5.0.0
