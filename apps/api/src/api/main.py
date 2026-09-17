@@ -123,6 +123,10 @@ app.include_router(prof_router)
 from src.api import objects
 app.include_router(objects.router)
 
+# HIA-71: Connector 框架 API
+from src.api import connectors
+app.include_router(connectors.router)
+
 # 发布与交付路由
 from src.api.release import router as release_router, cr_router as change_request_router
 app.include_router(release_router)
@@ -147,6 +151,8 @@ async def api_root() -> dict:
             "profiling": "/profiling",
             "objects": "/objects/projects/{id}/objects",
             "links": "/objects/projects/{id}/links",
+            "connectors": "/connectors",
+            "connector_types": "/connectors/types",
             "releases": "/releases",
             "change_requests": "/change-requests",
             "deployments": "/deployments",

@@ -28,7 +28,7 @@ from sqlalchemy import (
 from sqlalchemy import Uuid as UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from .base import Base, UUIDMixin, TimestampMixin, SoftDeleteMixin, ProjectMixin
+from .base import Base, UUIDMixin, TimestampMixin, SoftDeleteMixin
 
 if TYPE_CHECKING:
     from .project import Project
@@ -60,7 +60,7 @@ class ConnectorStatus(str, Enum):
     ARCHIVED = "archived"      # 已删除
 
 
-class Connector(Base, UUIDMixin, TimestampMixin, SoftDeleteMixin, ProjectMixin):
+class Connector(Base, UUIDMixin, TimestampMixin, SoftDeleteMixin):
     """一个项目下的连接器实例。
 
     - ``type`` 决定实现；
@@ -76,6 +76,9 @@ class Connector(Base, UUIDMixin, TimestampMixin, SoftDeleteMixin, ProjectMixin):
         ForeignKey("projects.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
+    )
+    created_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True
     )
 
     type: Mapped[ConnectorType] = mapped_column(

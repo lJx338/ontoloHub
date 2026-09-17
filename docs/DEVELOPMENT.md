@@ -134,6 +134,33 @@ prototype/         # 设计原型，独立维护，不进生产
 - 不要在测试里直接 `asyncio.run(...)`；用 `@pytest.mark.asyncio`。
 - 不要 mock 数据库 — 用真 SQLite + alembic。Mock 会让隔离 bug 漏到生产。
 
+### 4.4 Connector 框架测试
+
+Connector 有两类测试：
+
+1. **单元测试**（`tests/test_connectors.py`）：测试注册表、CSV/JSON/PG connector
+   实现，不走 DB、不走 API，直接 `get_connector()` 实例调用 async 方法。
+
+2. **集成测试**（`tests/test_connectors_api.py`）：走 httpx AsyncClient，覆盖 API
+   端到端流程。**必须**先用 `isolated_app` fixture 创建独立 SQLite DB，再调用
+   `ensure_bootstrap_admin()`，最后注入 `X-User-Id` header。
+
+```python
+# connector 单元测试模板
+import pytest
+from src.services.connectors import get_connector
+
+@pytest.mark.asyncio
+async def test_csv_snapshot(tmp_path):
+    path = tmp_path / "test.csv"
+    path.write_text("id,name\n1,Alice\n2,Bob")
+    c = get_connector("csv", {"path": str(path)})
+    ok, msg = await c.test_connection()
+    assert ok
+    snap = await c.snapshot(path.stem, limit=1)
+    assert snap.row_count == 1
+```
+
 ---
 
 ## 5. 前端约定（apps/web）
@@ -279,6 +306,37 @@ command.upgrade(alembic_cfg, "head")             # 3. 在新 DB 上跑迁移
 - 改完 ORM 必须 `alembic revision --autogenerate -m "..."` 一次，对比 diff，提交。
 - CI 的工作流里至少跑一次 `alembic upgrade head` 后再启动后端。
 
+### 6.11 `_framework.py` 不能从 `__init__.py` 倒导（循环导入）
+
+**症状**：`ImportError: cannot import name 'Connector' from partially initialized module ... circular import`
+
+**原因**：`__init__.py` 里的 `from ._framework import Connector` 触发 `_framework.py` 执行，
+而 `_framework.py` 又 `from .__init__ import Connector` — 死循环。
+
+**规避**：`_framework.py` 必须包含**所有**实际定义（`Connector` ABC、`register` 装饰器、
+dataclass）。`__init__.py` 只做 re-export + 触发 `@register`。
+**永远不要**在 `_framework.py` 里写 `from .__init__ import ...`。
+
+### 6.12 SQLAlchemy mixin 里定义的字段不能和子类显式字段重复
+
+**症状**：`ArgumentError: Column 'description' is already present in this mapping.`
+
+**原因**：`DescriptionMixin.description` 在 mixin 里定义了，`Connector.description` 又在子类
+体里定义了一次，SQLAlchemy 试图映射两次。
+
+**规避**：Mixin 只用来提供**多个类共享的字段**。如果某字段只在一个类里用，
+直接写到类体里，不走 mixin。Connector 只从 `Base, UUIDMixin, TimestampMixin,
+SoftDeleteMixin` 继承，按需显式定义自己的 `description` / `created_by`。
+
+### 6.13 CSV `limit` / `offset` 截断逻辑
+
+**症状**：`snapshot(limit=5, offset=5)` 实际返回 10 行（offset 被吃掉）。
+
+**原因**：错误的 break 条件 `len(rows) >= limit + offset` 导致多读了 offset 那么多行。
+
+**规避**：CSV snapshot 全量读入后用 Python list 切片（`rows[offset:offset+limit]`），
+不要在迭代中途做 break 判断。`truncated = total > len(rows)`。
+
 ---
 
 ## 7. 工具链 / 环境陷阱
@@ -318,13 +376,73 @@ command.upgrade(alembic_cfg, "head")             # 3. 在新 DB 上跑迁移
 - [ ] Alembic 迁移存在且 `upgrade / downgrade` 对称？
 - [ ] 新代码加了测试？happy / 跨项目 / 角色不足 / 审计 / 入参校验 五类都有？
 - [ ] 没有 hard-coded URL / 端口 / 密钥？
+- [ ] 新增的 connector 类型写了单元测试？测试了 offset/limit 截断吗？
+- [ ] Connector config 的 `secret_fields` 字段在落盘前加密了吗？测试验证 DB 里是密文吗？
 - [ ] 没把 `datetime.utcnow()` / `func.now()` 用在审计时间上？
 - [ ] 没把 ORM 实例直接当 Pydantic 返回？
 - [ ] 改动没破坏 §1–§5 任何一条？
 
 ---
 
-## 9. 文档维护
+## 9. Connector 框架（HIA-71 / HIA-67）
+
+### 9.1 架构
+
+```
+src.services.connectors/
+    _framework.py   # 基类 + 注册表 + 数据结构（**不要** 从 __init__ 倒导）
+    __init__.py     # re-export + import 触发 @register
+    file_connectors.py   # CSV / Excel / JSON / Parquet
+    postgres_connector.py # PostgreSQL 只读
+```
+
+**导入顺序规则**：`_framework.py` 定义所有类；`__init__.py` 从 `_framework` re-export；
+**禁止** 在 `_framework.py` 里 `from .__init__ import ...`（循环导入）。
+
+### 9.2 新增 connector 类型
+
+```python
+# 在对应的 _connectors.py 里：
+@register
+class MyConnector(Connector):
+    type: ClassVar[str] = "my_type"   # 注册 key，全局唯一
+
+    async def test_connection(self) -> tuple[bool, str]: ...
+    async def list_tables(self) -> list[TableInfo]: ...
+    async def snapshot(self, table, *, limit=1000, offset=0) -> SnapshotResult: ...
+```
+
+在 `__init__.py` 底部 `import` 触发装饰器生效。
+
+### 9.3 敏感字段加密
+
+`Connector.config` 中任何包含密码/token 的字段必须在 `secret_fields` 列表里声明，
+API 会在落盘前调用 `encrypt_secret_fields(config, secret_fields)`，读取时
+`mask_secret_fields` 替换为 `"***"`。
+
+**永远不要**把明文密码写到 `config` 里再存 DB。
+
+```python
+# API 层示例（见 apps/api/src/api/connectors.py）
+from src.core.secrets import encrypt_secret_fields, decrypt_secret_fields, mask_secret_fields
+
+# 创建
+encrypted = encrypt_secret_fields(raw_config, ["password", "token"])
+conn = Connector(config=encrypted, secret_fields=["password", "token"], ...)
+
+# 读取（默认 mask）
+cfg = mask_secret_fields(conn.config, conn.secret_fields)  # → {"password": "***"}
+
+# 读取明文（需要 EDITOR+）
+cfg = decrypt_secret_fields(conn.config, conn.secret_fields)
+```
+
+### 9.4 API 路由模式
+
+Connector API 遵循 `project_id` 放 **Query 参数**的模式（与其他 Sources/Evidence 路由一致），
+所以用 `require_role_query`。
+
+## 10. 文档维护
 
 - 这份文件本身有错、或遇到新坑没写进来 → **直接改**；不要在 PR 评论里口头说。
 - 改了约定但没更新本文件 → 评审时会被打回。

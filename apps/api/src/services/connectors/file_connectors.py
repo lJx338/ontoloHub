@@ -80,9 +80,6 @@ class CSVConnector(Connector):
         offset: int = 0,
     ) -> SnapshotResult:
         path = self._path()
-        rows: list[dict[str, Any]] = []
-        headers: list[str] = []
-        total_seen = 0
         try:
             with path.open(
                 "r",
@@ -93,25 +90,22 @@ class CSVConnector(Connector):
                     f, delimiter=self.config.get("delimiter", ",")
                 )
                 headers = list(reader.fieldnames or [])
-                skipped = 0
-                for raw in reader:
-                    if offset and skipped < offset:
-                        skipped += 1
-                        continue
-                    total_seen += 1
-                    rows.append(dict(raw))
-                    if limit and limit > 0 and len(rows) >= limit + offset:
-                        break
+                # 全量读入（用于切分 + truncated 判断），典型 profiler 场景文件不会太大
+                all_rows: list[dict[str, Any]] = [dict(r) for r in reader]
         except FileNotFoundError as e:
             raise ConnectorError(f"csv file not found: {path}") from e
-        truncated = total_seen > len(rows) + offset
+
+        total = len(all_rows)
+        sliced = all_rows[offset:]
+        truncated = total > len(sliced) if limit else False
+        rows = sliced[:limit] if limit else sliced
         fields = [
             SchemaField(name=h, data_type="string", nullable=True)
             for h in headers
         ]
         return SnapshotResult(
             table=path.stem,
-            rows=rows[:limit] if limit else rows,
+            rows=rows,
             fields=fields,
             row_count=len(rows),
             truncated=truncated,

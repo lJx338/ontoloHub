@@ -26,6 +26,7 @@ from .runtime import ObjectView, ActionType, ActionRun, AutomationRule, Task
 from .release import ChangeRequest, Release, UseCaseBundle, Deployment, PreflightReport
 from .governance import PluginInstallation, AuditEvent, DriftProposal, HealthSnapshot
 from .identity import User, Membership, GlobalRole, Role, has_role
+from .connector import Connector, ConnectorType, ConnectorStatus
 
 __all__ = [
     "Base",
@@ -88,10 +89,14 @@ __all__ = [
     "AuditEvent",
     "DriftProposal",
     "HealthSnapshot",
-    # ??????HIA-51 M1-01?
+    # 身份与权限（HIA-51 M1-01）
     "User",
     "Membership",
     "GlobalRole",
     "Role",
     "has_role",
+    # Connector 框架（HIA-71）
+    "Connector",
+    "ConnectorType",
+    "ConnectorStatus",
 ]
