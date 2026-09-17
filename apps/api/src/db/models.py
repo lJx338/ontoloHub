@@ -25,6 +25,7 @@ from .validation import MappingFixture, ValidationRun, SavedQuery, ExpectedResul
 from .runtime import ObjectView, ActionType, ActionRun, AutomationRule, Task
 from .release import ChangeRequest, Release, UseCaseBundle, Deployment, PreflightReport
 from .governance import PluginInstallation, AuditEvent, DriftProposal, HealthSnapshot
+from .identity import User, Membership, GlobalRole, Role, has_role
 
 __all__ = [
     "Base",
@@ -87,4 +88,10 @@ __all__ = [
     "AuditEvent",
     "DriftProposal",
     "HealthSnapshot",
+    # ??????HIA-51 M1-01?
+    "User",
+    "Membership",
+    "GlobalRole",
+    "Role",
+    "has_role",
 ]

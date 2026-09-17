@@ -1,27 +1,63 @@
-"""数据源 API 路由"""
+"""??? / ?? / ?? API ???HIA-49 / HIA-55 / M1-02??
+
+?? M1-02 ?????
+- ??????``GET /evidences/project/{project_id}`` ????????
+- ?????``Evidence.source_id`` + ``location`` + ``field_name`` + ``record_id``
+  ?????? "???? ? ????" ???
+- ?????????? ``require_role(Role.X)``?????/?? 404 ??
+- ?????``align / reject / bulk-confirm / bulk-reject`` ???????
+"""
+from __future__ import annotations
+
+import csv
+import hashlib
+import io
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.connection import get_session
 from src.db.evidence import (
+    Evidence,
+    EvidenceType,
+    ProfilingRun,
     Source,
     SourceSnapshot,
-    Evidence,
-    ProfilingRun,
-    SourceType,
     SourceStatus,
-    EvidenceType,
+    SourceType,
+)
+from src.db.identity import Role
+from src.db.governance import AuditEventType
+from src.api.auth import (
+    CurrentPrincipal,
+    coerce_diff,
+    record_audit,
+    require_role,
+    require_role_query,
 )
 
-router = APIRouter(prefix="/sources", tags=["数据源"])
 
+# =====================================================================
+# Source CRUD?????? + ???
+# =====================================================================
 
-# ============ Pydantic 模型 ============
+router = APIRouter(prefix="/sources", tags=["data-sources"])
+
 
 class SourceCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
@@ -35,10 +71,12 @@ class SourceUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     status: Optional[SourceStatus] = None
+    access_scope: Optional[str] = None
 
 
 class SourceResponse(BaseModel):
     id: uuid.UUID
+    project_id: uuid.UUID
     name: str
     description: Optional[str]
     source_type: SourceType
@@ -46,6 +84,7 @@ class SourceResponse(BaseModel):
     file_size: Optional[int]
     row_count: Optional[int]
     column_count: Optional[int]
+    access_scope: str
     created_at: str
 
     model_config = {"from_attributes": True}
@@ -77,6 +116,7 @@ class EvidenceCreate(BaseModel):
     property_iri: Optional[str] = None
     strength: str = "medium"
     notes: Optional[str] = None
+    record_id: Optional[str] = None
 
 
 class EvidenceResponse(BaseModel):
@@ -84,6 +124,7 @@ class EvidenceResponse(BaseModel):
     evidence_type: EvidenceType
     location: Optional[str]
     field_name: Optional[str]
+    record_id: Optional[str]
     content: Optional[str]
     source_identifier: Optional[str]
     ontology_class_iri: Optional[str]
@@ -95,49 +136,107 @@ class EvidenceResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-# ============ 数据源路由 ============
+# ---------- helpers ----------
+
+async def _load_source_for_project(
+    session: AsyncSession,
+    *,
+    source_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> Source:
+    """????? source ???? project?????????? 404?"""
+    result = await session.execute(
+        select(Source).where(
+            Source.id == source_id, Source.project_id == project_id
+        )
+    )
+    s = result.scalar_one_or_none()
+    if s is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    return s
+
+
+async def _load_evidence_for_project(
+    session: AsyncSession,
+    *,
+    evidence_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> Evidence:
+    result = await session.execute(
+        select(Evidence).where(
+            Evidence.id == evidence_id, Evidence.project_id == project_id
+        )
+    )
+    e = result.scalar_one_or_none()
+    if e is None:
+        raise HTTPException(status_code=404, detail="evidence not found")
+    return e
+
+
+def _source_to_response(s: Source) -> SourceResponse:
+    return SourceResponse(
+        id=s.id,
+        project_id=s.project_id,
+        name=s.name,
+        description=s.description,
+        source_type=s.source_type,
+        status=s.status,
+        file_size=s.file_size,
+        row_count=s.row_count,
+        column_count=s.column_count,
+        access_scope=s.access_scope,
+        created_at=s.created_at.isoformat() if s.created_at else "",
+    )
+
+
+def _evidence_to_response(e: Evidence) -> EvidenceResponse:
+    return EvidenceResponse(
+        id=e.id,
+        evidence_type=e.evidence_type,
+        location=e.location,
+        field_name=e.field_name,
+        record_id=e.record_id,
+        content=e.content,
+        source_identifier=e.source_identifier,
+        ontology_class_iri=e.ontology_class_iri,
+        property_iri=e.property_iri,
+        is_confirmed=e.is_confirmed,
+        strength=e.strength,
+        created_at=e.created_at.isoformat() if e.created_at else "",
+    )
+
+
+# ---------- Source ?? ----------
 
 @router.get("", response_model=list[SourceResponse])
 async def list_sources(
-    session: AsyncSession = Depends(get_session),
-    project_id: uuid.UUID = Query(..., description="项目 ID"),
+    project_id: uuid.UUID = Query(..., description="project scope"),
     source_type: Optional[SourceType] = Query(None),
-    status: Optional[SourceStatus] = Query(None),
+    status_filter: Optional[SourceStatus] = Query(None, alias="status"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.VIEWER)),
+    session: AsyncSession = Depends(get_session),
 ) -> list[SourceResponse]:
+    """List sources scoped to a project. ``require_role`` ?? 404 ?????"""
     query = select(Source).where(Source.project_id == project_id)
-    
     if source_type:
         query = query.where(Source.source_type == source_type)
-    if status:
-        query = query.where(Source.status == status)
-    
+    if status_filter:
+        query = query.where(Source.status == status_filter)
     query = query.order_by(Source.created_at.desc())
-    
     result = await session.execute(query)
-    sources = result.scalars().all()
-    
-    return [
-        SourceResponse(
-            id=s.id,
-            name=s.name,
-            description=s.description,
-            source_type=s.source_type,
-            status=s.status,
-            file_size=s.file_size,
-            row_count=s.row_count,
-            column_count=s.column_count,
-            created_at=s.created_at.isoformat() if s.created_at else "",
-        )
-        for s in sources
-    ]
+    return [_source_to_response(s) for s in result.scalars().all()]
 
 
 @router.post("", response_model=SourceResponse, status_code=status.HTTP_201_CREATED)
 async def create_source(
     data: SourceCreate,
+    request: Request,
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.EDITOR)),
     session: AsyncSession = Depends(get_session),
-    project_id: uuid.UUID = Query(...),
 ) -> SourceResponse:
+    """?????? Source?HIA-49 ??????????"""
+    principal, _ = ctx
     source = Source(
         project_id=project_id,
         name=data.name,
@@ -146,209 +245,200 @@ async def create_source(
         connection_info=data.connection_info,
         access_scope=data.access_scope,
         status=SourceStatus.UPLOADED,
+        created_by=principal.user.id,
     )
-    
     session.add(source)
     await session.flush()
     await session.refresh(source)
-    
-    return SourceResponse(
-        id=source.id,
-        name=source.name,
-        description=source.description,
-        source_type=source.source_type,
-        status=source.status,
-        file_size=source.file_size,
-        row_count=source.row_count,
-        column_count=source.column_count,
-        created_at=source.created_at.isoformat() if source.created_at else "",
+    await record_audit(
+        session,
+        event_type=AuditEventType.CREATE,
+        principal=principal,
+        project_id=project_id,
+        request=request,
+        target_type="source",
+        target_id=str(source.id),
+        target_label=source.name,
+        after=coerce_diff(source),
     )
+    return _source_to_response(source)
 
 
 @router.get("/{source_id}", response_model=SourceResponse)
 async def get_source(
     source_id: uuid.UUID,
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.VIEWER)),
     session: AsyncSession = Depends(get_session),
 ) -> SourceResponse:
-    result = await session.execute(
-        select(Source).where(Source.id == source_id)
+    """? source_id + project_id ????? Source?????"""
+    s = await _load_source_for_project(
+        session, source_id=source_id, project_id=project_id
     )
-    source = result.scalar_one_or_none()
-    
-    if not source:
-        raise HTTPException(status_code=404, detail="数据源不存在")
-    
-    return SourceResponse(
-        id=source.id,
-        name=source.name,
-        description=source.description,
-        source_type=source.source_type,
-        status=source.status,
-        file_size=source.file_size,
-        row_count=source.row_count,
-        column_count=source.column_count,
-        created_at=source.created_at.isoformat() if source.created_at else "",
-    )
+    return _source_to_response(s)
 
 
 @router.patch("/{source_id}", response_model=SourceResponse)
 async def update_source(
     source_id: uuid.UUID,
     data: SourceUpdate,
+    request: Request,
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.EDITOR)),
     session: AsyncSession = Depends(get_session),
 ) -> SourceResponse:
-    result = await session.execute(
-        select(Source).where(Source.id == source_id)
+    principal, _ = ctx
+    s = await _load_source_for_project(
+        session, source_id=source_id, project_id=project_id
     )
-    source = result.scalar_one_or_none()
-    
-    if not source:
-        raise HTTPException(status_code=404, detail="数据源不存在")
-    
-    update_data = data.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(source, field, value)
-    
+    before = coerce_diff(s)
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(s, field, value)
     await session.flush()
-    await session.refresh(source)
-    
-    return SourceResponse(
-        id=source.id,
-        name=source.name,
-        description=source.description,
-        source_type=source.source_type,
-        status=source.status,
-        file_size=source.file_size,
-        row_count=source.row_count,
-        column_count=source.column_count,
-        created_at=source.created_at.isoformat() if source.created_at else "",
+    await session.refresh(s)
+    await record_audit(
+        session,
+        event_type=AuditEventType.UPDATE,
+        principal=principal,
+        project_id=project_id,
+        request=request,
+        target_type="source",
+        target_id=str(s.id),
+        target_label=s.name,
+        before=before,
+        after=coerce_diff(s),
     )
+    return _source_to_response(s)
 
 
 @router.delete("/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_source(
     source_id: uuid.UUID,
+    request: Request,
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.OWNER)),
     session: AsyncSession = Depends(get_session),
 ) -> None:
-    result = await session.execute(
-        select(Source).where(Source.id == source_id)
+    principal, _ = ctx
+    s = await _load_source_for_project(
+        session, source_id=source_id, project_id=project_id
     )
-    source = result.scalar_one_or_none()
-    
-    if not source:
-        raise HTTPException(status_code=404, detail="数据源不存在")
-    
-    await session.delete(source)
+    before = coerce_diff(s)
+    label = s.name
+    sid = str(s.id)
+    await session.delete(s)
+    await session.flush()
+    await record_audit(
+        session,
+        event_type=AuditEventType.DELETE,
+        principal=principal,
+        project_id=project_id,
+        request=request,
+        target_type="source",
+        target_id=sid,
+        target_label=label,
+        before=before,
+    )
 
 
-# ============ 证据路由 ============
+# ---------- ??????? source ??? ----------
 
 @router.get("/{source_id}/evidences", response_model=list[EvidenceResponse])
 async def list_evidences(
     source_id: uuid.UUID,
-    session: AsyncSession = Depends(get_session),
+    project_id: uuid.UUID = Query(..., description="project scope"),
     ontology_class_iri: Optional[str] = Query(None),
     property_iri: Optional[str] = Query(None),
     is_confirmed: Optional[bool] = Query(None),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.VIEWER)),
+    session: AsyncSession = Depends(get_session),
 ) -> list[EvidenceResponse]:
-    query = select(Evidence).where(Evidence.source_id == source_id)
-    
+    s = await _load_source_for_project(
+        session, source_id=source_id, project_id=project_id
+    )
+    query = select(Evidence).where(
+        Evidence.source_id == s.id, Evidence.project_id == project_id
+    )
     if ontology_class_iri:
         query = query.where(Evidence.ontology_class_iri == ontology_class_iri)
     if property_iri:
         query = query.where(Evidence.property_iri == property_iri)
     if is_confirmed is not None:
         query = query.where(Evidence.is_confirmed == is_confirmed)
-    
     query = query.order_by(Evidence.created_at.desc())
-    
     result = await session.execute(query)
-    evidences = result.scalars().all()
-    
-    return [
-        EvidenceResponse(
-            id=e.id,
-            evidence_type=e.evidence_type,
-            location=e.location,
-            field_name=e.field_name,
-            content=e.content,
-            source_identifier=e.source_identifier,
-            ontology_class_iri=e.ontology_class_iri,
-            property_iri=e.property_iri,
-            is_confirmed=e.is_confirmed,
-            strength=e.strength,
-            created_at=e.created_at.isoformat() if e.created_at else "",
-        )
-        for e in evidences
-    ]
+    return [_evidence_to_response(e) for e in result.scalars().all()]
 
 
-@router.post("/{source_id}/evidences", response_model=EvidenceResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/{source_id}/evidences", response_model=EvidenceResponse, status_code=status.HTTP_201_CREATED
+)
 async def create_evidence(
     source_id: uuid.UUID,
     data: EvidenceCreate,
+    request: Request,
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.EDITOR)),
     session: AsyncSession = Depends(get_session),
-    project_id: uuid.UUID = Query(...),
 ) -> EvidenceResponse:
-    # 获取数据源的项目 ID
-    source_result = await session.execute(
-        select(Source).where(Source.id == source_id)
+    principal, _ = ctx
+    s = await _load_source_for_project(
+        session, source_id=source_id, project_id=project_id
     )
-    source = source_result.scalar_one_or_none()
-    if not source:
-        raise HTTPException(status_code=404, detail="数据源不存在")
-    
     evidence = Evidence(
         project_id=project_id,
-        source_id=source_id,
+        source_id=s.id,
         evidence_type=data.evidence_type,
         location=data.location,
         field_name=data.field_name,
+        record_id=data.record_id,
         content=data.content,
         source_identifier=data.source_identifier,
         ontology_class_iri=data.ontology_class_iri,
         property_iri=data.property_iri,
         strength=data.strength,
         notes=data.notes,
+        created_by=principal.user.id,
     )
-    
     session.add(evidence)
     await session.flush()
     await session.refresh(evidence)
-    
-    return EvidenceResponse(
-        id=evidence.id,
-        evidence_type=evidence.evidence_type,
-        location=evidence.location,
-        field_name=evidence.field_name,
-        content=evidence.content,
-        source_identifier=evidence.source_identifier,
-        ontology_class_iri=evidence.ontology_class_iri,
-        property_iri=evidence.property_iri,
-        is_confirmed=evidence.is_confirmed,
-        strength=evidence.strength,
-        created_at=evidence.created_at.isoformat() if evidence.created_at else "",
+    await record_audit(
+        session,
+        event_type=AuditEventType.CREATE,
+        principal=principal,
+        project_id=project_id,
+        request=request,
+        target_type="evidence",
+        target_id=str(evidence.id),
+        target_label=data.field_name or data.content or "",
+        after=coerce_diff(evidence),
     )
+    return _evidence_to_response(evidence)
 
 
-# ============ 剖析路由 ============
+# ---------- ???? ----------
 
 @router.get("/{source_id}/profiling", response_model=list[ProfilingRunResponse])
 async def list_profiling_runs(
     source_id: uuid.UUID,
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.VIEWER)),
     session: AsyncSession = Depends(get_session),
 ) -> list[ProfilingRunResponse]:
+    s = await _load_source_for_project(
+        session, source_id=source_id, project_id=project_id
+    )
     result = await session.execute(
         select(ProfilingRun)
-        .where(ProfilingRun.source_id == source_id)
+        .where(ProfilingRun.source_id == s.id)
         .order_by(ProfilingRun.created_at.desc())
     )
-    runs = result.scalars().all()
     return [
         ProfilingRunResponse(
             id=r.id,
             source_id=r.source_id,
-            status=r.status.value if hasattr(r.status, 'value') else str(r.status),
+            status=r.status.value if hasattr(r.status, "value") else str(r.status),
             total_rows=r.total_rows,
             sampled_rows=r.sampled_rows,
             total_columns=r.total_columns,
@@ -358,43 +448,59 @@ async def list_profiling_runs(
             duration_ms=r.duration_ms,
             created_at=r.created_at.isoformat() if r.created_at else "",
         )
-        for r in runs
+        for r in result.scalars().all()
     ]
 
 
-@router.post("/{source_id}/profiling", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/{source_id}/profiling", status_code=status.HTTP_201_CREATED
+)
 async def create_profiling_run(
     source_id: uuid.UUID,
+    request: Request,
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.EDITOR)),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """创建剖析运行"""
-    profiling = ProfilingRun(
-        source_id=source_id,
-        status="pending",
+    principal, _ = ctx
+    s = await _load_source_for_project(
+        session, source_id=source_id, project_id=project_id
     )
-
+    profiling = ProfilingRun(
+        source_id=s.id,
+        status="pending",
+        created_by=principal.user.id,
+    )
     session.add(profiling)
     await session.flush()
     await session.refresh(profiling)
-
+    await record_audit(
+        session,
+        event_type=AuditEventType.CREATE,
+        principal=principal,
+        project_id=project_id,
+        request=request,
+        target_type="profiling_run",
+        target_id=str(profiling.id),
+        target_label=f"source:{s.id}",
+        after=coerce_diff(profiling),
+    )
     return {
         "id": str(profiling.id),
         "status": profiling.status,
-        "message": "剖析任务已创建",
+        "message": "profiling run created",
     }
 
 
 # =====================================================================
-# Evidence 项目级收件箱路由（独立 prefix，避免 source 嵌套限制）
+# Evidence ?????? + ?????? prefix /evidences?
 # =====================================================================
 
 
-ev_router = APIRouter(prefix="/evidences", tags=["证据"])
+ev_router = APIRouter(prefix="/evidences", tags=["evidence"])
 
 
 class EvidenceAlignInput(BaseModel):
-    """字段对齐输入"""
-
     ontology_class_iri: str = Field(..., max_length=500)
     property_iri: Optional[str] = Field(None, max_length=500)
     confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
@@ -402,8 +508,6 @@ class EvidenceAlignInput(BaseModel):
 
 
 class EvidenceAlignResponse(BaseModel):
-    """对齐输出"""
-
     id: uuid.UUID
     ontology_class_iri: str
     property_iri: Optional[str]
@@ -412,13 +516,13 @@ class EvidenceAlignResponse(BaseModel):
 
 
 class EvidenceInboxResponse(BaseModel):
-    """项目证据收件箱条目"""
-
     id: uuid.UUID
     source_id: Optional[uuid.UUID]
     source_name: Optional[str]
     evidence_type: EvidenceType
     field_name: Optional[str]
+    record_id: Optional[str]
+    location: Optional[str]
     content: Optional[str]
     ontology_class_iri: Optional[str]
     property_iri: Optional[str]
@@ -430,16 +534,12 @@ class EvidenceInboxResponse(BaseModel):
 
 
 class ProfilingExecuteRequest(BaseModel):
-    """执行剖析请求"""
-
     sample_size: int = Field(default=1000, ge=100, le=50000)
     include_stats: bool = True
     detect_enums: bool = True
 
 
 class FieldProfileResponse(BaseModel):
-    """字段剖析结果"""
-
     field_name: str
     data_type: str
     total_count: int
@@ -458,20 +558,22 @@ class FieldProfileResponse(BaseModel):
 
 @ev_router.get("/project/{project_id}", response_model=list[EvidenceInboxResponse])
 async def evidence_inbox(
-    project_id: uuid.UUID,
-    session: AsyncSession = Depends(get_session),
+    project_id: uuid.UUID = Path(..., description="project scope"),
     source_id: Optional[uuid.UUID] = Query(None),
     ontology_class_iri: Optional[str] = Query(None),
     is_confirmed: Optional[bool] = Query(None),
     search: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role(Role.VIEWER)),
+    session: AsyncSession = Depends(get_session),
 ) -> list[EvidenceInboxResponse]:
-    """项目级证据收件箱（合并所有来源的证据）"""
-    query = select(Evidence, Source.name).outerjoin(
-        Source, Evidence.source_id == Source.id
-    ).where(Evidence.project_id == project_id)
-
+    """????????????????????"""
+    query = (
+        select(Evidence, Source.name)
+        .outerjoin(Source, Evidence.source_id == Source.id)
+        .where(Evidence.project_id == project_id)
+    )
     if source_id:
         query = query.where(Evidence.source_id == source_id)
     if ontology_class_iri:
@@ -494,6 +596,8 @@ async def evidence_inbox(
             source_name=source_name,
             evidence_type=e.evidence_type,
             field_name=e.field_name,
+            record_id=e.record_id,
+            location=e.location,
             content=e.content,
             ontology_class_iri=e.ontology_class_iri,
             property_iri=e.property_iri,
@@ -508,56 +612,61 @@ async def evidence_inbox(
 @ev_router.get("/{evidence_id}", response_model=EvidenceResponse)
 async def get_evidence(
     evidence_id: uuid.UUID,
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.VIEWER)),
     session: AsyncSession = Depends(get_session),
 ) -> EvidenceResponse:
-    """获取证据详情"""
-    result = await session.execute(
-        select(Evidence).where(Evidence.id == evidence_id)
+    e = await _load_evidence_for_project(
+        session, evidence_id=evidence_id, project_id=project_id
     )
-    e = result.scalar_one_or_none()
-    if not e:
-        raise HTTPException(status_code=404, detail="证据不存在")
-
-    return EvidenceResponse(
-        id=e.id,
-        evidence_type=e.evidence_type,
-        location=e.location,
-        field_name=e.field_name,
-        content=e.content,
-        source_identifier=e.source_identifier,
-        ontology_class_iri=e.ontology_class_iri,
-        property_iri=e.property_iri,
-        is_confirmed=e.is_confirmed,
-        strength=e.strength,
-        created_at=e.created_at.isoformat() if e.created_at else "",
-    )
+    return _evidence_to_response(e)
 
 
 @ev_router.patch("/{evidence_id}/align", response_model=EvidenceAlignResponse)
 async def align_evidence(
     evidence_id: uuid.UUID,
     data: EvidenceAlignInput,
+    request: Request,
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.EDITOR)),
     session: AsyncSession = Depends(get_session),
 ) -> EvidenceAlignResponse:
-    """将证据对齐到本体类/属性
+    """?????????/???HIA-55 ??? ? confirm??
 
-    建立 field → ontology class + property 的语义映射。
-    多次对齐会覆盖前一次。
+    - ?????????????
+    - ???????
     """
-    result = await session.execute(
-        select(Evidence).where(Evidence.id == evidence_id)
+    principal, _ = ctx
+    e = await _load_evidence_for_project(
+        session, evidence_id=evidence_id, project_id=project_id
     )
-    e = result.scalar_one_or_none()
-    if not e:
-        raise HTTPException(status_code=404, detail="证据不存在")
-
+    before = coerce_diff(e)
     e.ontology_class_iri = data.ontology_class_iri
     e.property_iri = data.property_iri
+    if data.confidence is not None:
+        e.extraction_params = {
+            **(e.extraction_params or {}),
+            "confidence": data.confidence,
+        }
     e.is_confirmed = True
-
+    e.confirmed_by = principal.user.id
+    e.confirmed_at = datetime.now(timezone.utc)
+    if data.notes:
+        e.notes = data.notes
     await session.flush()
     await session.refresh(e)
-
+    await record_audit(
+        session,
+        event_type=AuditEventType.UPDATE,
+        principal=principal,
+        project_id=project_id,
+        request=request,
+        target_type="evidence",
+        target_id=str(e.id),
+        target_label=f"{e.field_name or e.content}@{data.ontology_class_iri}",
+        before=before,
+        after=coerce_diff(e),
+    )
     return EvidenceAlignResponse(
         id=e.id,
         ontology_class_iri=e.ontology_class_iri,
@@ -570,150 +679,559 @@ async def align_evidence(
 @ev_router.patch("/{evidence_id}/reject", response_model=EvidenceResponse)
 async def reject_evidence(
     evidence_id: uuid.UUID,
+    request: Request,
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.EDITOR)),
     session: AsyncSession = Depends(get_session),
 ) -> EvidenceResponse:
-    """拒绝证据（标记为未确认）"""
-    result = await session.execute(
-        select(Evidence).where(Evidence.id == evidence_id)
+    """?????HIA-55 ??? ? reject???????"""
+    principal, _ = ctx
+    e = await _load_evidence_for_project(
+        session, evidence_id=evidence_id, project_id=project_id
     )
-    e = result.scalar_one_or_none()
-    if not e:
-        raise HTTPException(status_code=404, detail="证据不存在")
-
+    before = coerce_diff(e)
     e.is_confirmed = False
     e.ontology_class_iri = None
     e.property_iri = None
-
+    e.confirmed_by = principal.user.id
+    e.confirmed_at = datetime.now(timezone.utc)
     await session.flush()
     await session.refresh(e)
-
-    return EvidenceResponse(
-        id=e.id,
-        evidence_type=e.evidence_type,
-        location=e.location,
-        field_name=e.field_name,
-        content=e.content,
-        source_identifier=e.source_identifier,
-        ontology_class_iri=e.ontology_class_iri,
-        property_iri=e.property_iri,
-        is_confirmed=e.is_confirmed,
-        strength=e.strength,
-        created_at=e.created_at.isoformat() if e.created_at else "",
+    await record_audit(
+        session,
+        event_type=AuditEventType.UPDATE,
+        principal=principal,
+        project_id=project_id,
+        request=request,
+        target_type="evidence",
+        target_id=str(e.id),
+        target_label=e.field_name or e.content or "",
+        before=before,
+        after=coerce_diff(e),
     )
+    return _evidence_to_response(e)
 
 
 @ev_router.post("/bulk-confirm", status_code=status.HTTP_200_OK)
 async def bulk_confirm_evidences(
-    evidence_ids: list[uuid.UUID],
-    ontology_class_iri: str = Query(..., max_length=500),
-    property_iri: Optional[str] = Query(None, max_length=500),
+    request: Request,
+    payload: dict,
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.EDITOR)),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """批量确认证据并对齐到本体"""
-    if not evidence_ids:
-        return {"updated": 0}
+    """?????????????? project ????? 1 ??????"""
+    principal, _ = ctx
+    evidence_ids_raw = payload.get("evidence_ids") or []
+    ontology_class_iri: str = payload.get("ontology_class_iri", "")
+    property_iri: Optional[str] = payload.get("property_iri")
+    if not evidence_ids_raw or not ontology_class_iri:
+        raise HTTPException(status_code=400, detail="evidence_ids and ontology_class_iri are required")
+    try:
+        evidence_ids = [uuid.UUID(str(x)) for x in evidence_ids_raw]
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"invalid evidence id: {e}")
 
     result = await session.execute(
-        select(Evidence).where(Evidence.id.in_(evidence_ids))
+        select(Evidence).where(
+            Evidence.id.in_(evidence_ids), Evidence.project_id == project_id
+        )
     )
     evidences = result.scalars().all()
 
-    updated = 0
+    confirmed_at = datetime.now(timezone.utc)
     for e in evidences:
         e.ontology_class_iri = ontology_class_iri
         e.property_iri = property_iri
         e.is_confirmed = True
-        updated += 1
+        e.confirmed_by = principal.user.id
+        e.confirmed_at = confirmed_at
 
     await session.flush()
-    return {"updated": updated, "total": len(evidence_ids)}
+    await record_audit(
+        session,
+        event_type=AuditEventType.UPDATE,
+        principal=principal,
+        project_id=project_id,
+        request=request,
+        target_type="evidence_bulk",
+        target_id=",".join(sorted(str(e.id) for e in evidences))[:255],
+        target_label=f"bulk-confirm@{ontology_class_iri}",
+        after={
+            "count": len(evidences),
+            "ontology_class_iri": ontology_class_iri,
+            "property_iri": property_iri,
+            "evidence_ids": [str(e.id) for e in evidences],
+        },
+        notes=f"requested={len(evidence_ids)} matched={len(evidences)}",
+    )
+    return {"updated": len(evidences), "total": len(evidence_ids)}
 
 
 @ev_router.post("/bulk-reject", status_code=status.HTTP_200_OK)
 async def bulk_reject_evidences(
-    evidence_ids: list[uuid.UUID],
+    request: Request,
+    payload: dict,
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.EDITOR)),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """批量拒绝证据"""
-    if not evidence_ids:
-        return {"updated": 0}
+    """???????? project ????? 1 ??????"""
+    principal, _ = ctx
+    evidence_ids_raw = payload.get("evidence_ids") or []
+    if not evidence_ids_raw:
+        raise HTTPException(status_code=400, detail="evidence_ids required")
+    try:
+        evidence_ids = [uuid.UUID(str(x)) for x in evidence_ids_raw]
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"invalid evidence id: {e}")
 
     result = await session.execute(
-        select(Evidence).where(Evidence.id.in_(evidence_ids))
+        select(Evidence).where(
+            Evidence.id.in_(evidence_ids), Evidence.project_id == project_id
+        )
     )
     evidences = result.scalars().all()
 
-    updated = 0
+    confirmed_at = datetime.now(timezone.utc)
     for e in evidences:
         e.is_confirmed = False
         e.ontology_class_iri = None
         e.property_iri = None
-        updated += 1
+        e.confirmed_by = principal.user.id
+        e.confirmed_at = confirmed_at
 
     await session.flush()
-    return {"updated": updated, "total": len(evidence_ids)}
+    await record_audit(
+        session,
+        event_type=AuditEventType.UPDATE,
+        principal=principal,
+        project_id=project_id,
+        request=request,
+        target_type="evidence_bulk",
+        target_id=",".join(sorted(str(e.id) for e in evidences))[:255],
+        target_label="bulk-reject",
+        after={
+            "count": len(evidences),
+            "evidence_ids": [str(e.id) for e in evidences],
+        },
+        notes=f"requested={len(evidence_ids)} matched={len(evidences)}",
+    )
+    return {"updated": len(evidences), "total": len(evidence_ids)}
 
 
 # =====================================================================
-# 字段剖析执行路由（独立 prefix）
+# ???????HIA-49 ? CSV/XLSX/??/Markdown ?? + ?????
 # =====================================================================
 
 
-prof_router = APIRouter(prefix="/profiling", tags=["剖析"])
+class SourceUploadResponse(BaseModel):
+    source: SourceResponse
+    snapshot_id: uuid.UUID
+    row_count: int
+    column_count: int
+    auto_evidence_count: int
+    auto_evidence_ids: list[uuid.UUID]
+
+
+@router.post(
+    "/upload",
+    response_model=SourceUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_source(
+    request: Request,
+    file: UploadFile = File(...),
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    description: Optional[str] = Query(None),
+    auto_evidence: bool = Query(
+        True,
+        description="????????? SOURCE_FIELD ?????????????",
+    ),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.EDITOR)),
+    session: AsyncSession = Depends(get_session),
+) -> SourceUploadResponse:
+    """HIA-49 ? ?? CSV/XLSX/??/Markdown?????? Source + Snapshot + ?????
+
+    - ?????? 32 MB???? 413?
+    - ????? SourceSnapshot.checksum
+    - ?????? ``SOURCE_FIELD`` ???location=``column:<name>``????????
+    - ????
+    """
+    principal, _ = ctx
+
+    MAX_BYTES = 32 * 1024 * 1024
+    content = await file.read()
+    if len(content) > MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"file too large; max {MAX_BYTES} bytes",
+        )
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="empty file")
+
+    filename = file.filename or "upload"
+    source_type = _infer_source_type(filename, file.content_type)
+
+    if source_type in (SourceType.CSV,):
+        fields, row_count, sample_rows = _parse_csv(content)
+    elif source_type in (SourceType.XLSX,):
+        try:
+            fields, row_count, sample_rows = _parse_xlsx(content)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"xlsx parse failed: {exc}")
+    elif source_type in (SourceType.TEXT, SourceType.MARKDOWN):
+        fields, row_count, sample_rows = _parse_text(content)
+    elif source_type == SourceType.JSON:
+        fields, row_count, sample_rows = _parse_json(content)
+    else:
+        fields, row_count, sample_rows = [], 0, []
+
+    schema_info = {
+        "filename": filename,
+        "content_type": file.content_type,
+        "fields": fields,
+        "sample_rows": sample_rows,
+    }
+
+    checksum = hashlib.sha256(content).hexdigest()
+
+    source = Source(
+        project_id=project_id,
+        name=filename,
+        description=description,
+        source_type=source_type,
+        connection_info={"filename": filename, "content_type": file.content_type},
+        file_path=None,
+        file_size=len(content),
+        row_count=row_count,
+        column_count=len(fields),
+        access_scope="restricted",
+        is_sensitive=False,
+        schema_info=schema_info,
+        status=SourceStatus.PARSED if fields else SourceStatus.UPLOADED,
+        created_by=principal.user.id,
+    )
+    session.add(source)
+    await session.flush()
+    await session.refresh(source)
+
+    snapshot = SourceSnapshot(
+        source_id=source.id,
+        version=1,
+        snapshot_type="upload",
+        storage_path=None,
+        storage_size=len(content),
+        checksum=checksum,
+        row_count=row_count,
+        schema_hash=hashlib.sha256(
+            (",".join(f.get("name", "") for f in fields)).encode("utf-8")
+        ).hexdigest(),
+        created_by=principal.user.id,
+    )
+    session.add(snapshot)
+    await session.flush()
+    await session.refresh(snapshot)
+
+    auto_evidence_ids: list[uuid.UUID] = []
+    if auto_evidence and fields:
+        for f in fields:
+            ev = Evidence(
+                project_id=project_id,
+                source_id=source.id,
+                evidence_type=EvidenceType.SOURCE_FIELD,
+                location=f"column:{f.get('name', '')}",
+                field_name=f.get("name"),
+                content=", ".join(f.get("sample_values", [])[:5]) or None,
+                source_identifier=filename,
+                extraction_method="upload_parse",
+                extraction_params={
+                    "inferred_type": f.get("type"),
+                    "row": None,
+                },
+                strength="medium",
+                created_by=principal.user.id,
+            )
+            session.add(ev)
+        await session.flush()
+        result = await session.execute(
+            select(Evidence).where(
+                Evidence.source_id == source.id,
+                Evidence.project_id == project_id,
+                Evidence.evidence_type == EvidenceType.SOURCE_FIELD,
+            )
+        )
+        auto_evidence_ids = [e.id for e in result.scalars().all()]
+
+    await record_audit(
+        session,
+        event_type=AuditEventType.CREATE,
+        principal=principal,
+        project_id=project_id,
+        request=request,
+        target_type="source",
+        target_id=str(source.id),
+        target_label=source.name,
+        after={
+            "filename": filename,
+            "source_type": source_type.value,
+            "row_count": row_count,
+            "column_count": len(fields),
+            "snapshot_id": str(snapshot.id),
+            "checksum": checksum,
+            "auto_evidence_count": len(auto_evidence_ids),
+        },
+        notes=f"size={len(content)} bytes",
+    )
+
+    return SourceUploadResponse(
+        source=_source_to_response(source),
+        snapshot_id=snapshot.id,
+        row_count=row_count,
+        column_count=len(fields),
+        auto_evidence_count=len(auto_evidence_ids),
+        auto_evidence_ids=auto_evidence_ids,
+    )
+
+
+def _infer_source_type(filename: str, content_type: Optional[str]) -> SourceType:
+    name = filename.lower()
+    if name.endswith(".csv"):
+        return SourceType.CSV
+    if name.endswith((".xlsx", ".xlsm")):
+        return SourceType.XLSX
+    if name.endswith(".json") or (content_type or "").startswith("application/json"):
+        return SourceType.JSON
+    if name.endswith((".md", ".markdown")):
+        return SourceType.MARKDOWN
+    if name.endswith((".ttl", ".owl", ".nt", ".rdf")):
+        return SourceType.RDF
+    if content_type and content_type.startswith("text/"):
+        return SourceType.TEXT
+    return SourceType.TEXT
+
+
+def _parse_csv(content: bytes) -> tuple[list[dict], int, list[dict]]:
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = content.decode("gbk", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    rows: list[dict] = []
+    for i, row in enumerate(reader):
+        if i >= 100:
+            break
+        rows.append({k: (v if v is not None else "") for k, v in row.items()})
+    fields = _infer_fields(rows)
+    try:
+        total = sum(1 for _ in csv.DictReader(io.StringIO(text)))
+    except Exception:
+        total = len(rows)
+    return fields, total, rows
+
+
+def _parse_xlsx(content: bytes) -> tuple[list[dict], int, list[dict]]:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "openpyxl not installed; install via `pip install openpyxl`"
+        ) from exc
+    wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    ws = wb.active
+    if ws is None:
+        return [], 0, []
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        header = list(next(rows_iter))
+    except StopIteration:
+        return [], 0, []
+    header = [str(c) if c is not None else "" for c in header]
+    rows: list[dict] = []
+    for i, r in enumerate(rows_iter):
+        if i >= 100:
+            break
+        rows.append({header[j]: ("" if r[j] is None else str(r[j])) for j in range(len(header))})
+    fields = _infer_fields(rows)
+    total = ws.max_row or 0
+    return fields, total, rows
+
+
+def _parse_text(content: bytes) -> tuple[list[dict], int, list[dict]]:
+    text = content.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    return (
+        [{"name": "line", "type": "string", "sample_values": lines[:5]}],
+        len(lines),
+        [],
+    )
+
+
+def _parse_json(content: bytes) -> tuple[list[dict], int, list[dict]]:
+    import json as _json
+    text = content.decode("utf-8", errors="replace")
+    try:
+        data = _json.loads(text)
+    except _json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid json: {exc}") from exc
+    if isinstance(data, list):
+        rows = data[:100]
+        total = len(data)
+    elif isinstance(data, dict):
+        rows = [data]
+        total = 1
+    else:
+        rows = [{"value": str(data)}]
+        total = 1
+    fields = _infer_fields(rows)
+    return fields, total, rows
+
+
+def _infer_fields(rows: list[dict]) -> list[dict]:
+    if not rows:
+        return []
+    field_names: list[str] = []
+    seen: set[str] = set()
+    for r in rows:
+        for k in r.keys():
+            if k not in seen:
+                seen.add(k)
+                field_names.append(k)
+    out: list[dict] = []
+    for name in field_names:
+        values = [r.get(name) for r in rows if r.get(name) not in (None, "")]
+        sample_values = [str(v)[:200] for v in values[:5]]
+        inferred_type = _infer_scalar_type(values)
+        out.append(
+            {
+                "name": name,
+                "type": inferred_type,
+                "sample_values": sample_values,
+                "unique_count": len({str(v) for v in values}),
+                "null_count": sum(1 for r in rows if r.get(name) in (None, "")),
+            }
+        )
+    return out
+
+
+def _infer_scalar_type(values: list) -> str:
+    if not values:
+        return "string"
+    int_like = all(_is_int(v) for v in values)
+    if int_like:
+        return "integer"
+    float_like = all(_is_float(v) for v in values)
+    if float_like:
+        return "float"
+    bool_like = all(_is_bool(v) for v in values)
+    if bool_like:
+        return "boolean"
+    date_like = all(_is_date(v) for v in values)
+    if date_like:
+        return "date"
+    return "string"
+
+
+def _is_int(v) -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return True
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return False
+        try:
+            int(s)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _is_float(v) -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return True
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return False
+        try:
+            float(s)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _is_bool(v) -> bool:
+    if isinstance(v, bool):
+        return True
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "false", "yes", "no", "0", "1")
+    return False
+
+
+def _is_date(v) -> bool:
+    if not isinstance(v, str):
+        return False
+    s = v.strip()
+    if not s:
+        return False
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S"):
+        try:
+            datetime.strptime(s, fmt)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+# =====================================================================
+# ????????? prefix /profiling?
+# =====================================================================
+
+
+prof_router = APIRouter(prefix="/profiling", tags=["profiling"])
 
 
 @prof_router.post("/sources/{source_id}/execute", response_model=dict)
 async def execute_field_profiling(
     source_id: uuid.UUID,
     data: ProfilingExecuteRequest,
+    project_id: uuid.UUID = Query(..., description="project scope"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.EDITOR)),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """执行字段剖析
-
-    基于源数据的抽样样本，推断字段的：
-    - 数据类型（string / integer / float / boolean / date / enum）
-    - 空值比例
-    - 枚举值（detect_enums=True 时）
-    - 建议的本体属性类型
-
-    返回字段统计摘要，不做持久化（结果通过 profiling run 存储）。
-    """
-    # 确认源存在
-    src_result = await session.execute(
-        select(Source).where(Source.id == source_id)
+    """????????? Source.schema_info ???? schema ?????"""
+    s = await _load_source_for_project(
+        session, source_id=source_id, project_id=project_id
     )
-    source = src_result.scalar_one_or_none()
-    if not source:
-        raise HTTPException(status_code=404, detail="数据源不存在")
-
-    # 获取已存储的 schema_info
-    schema = source.schema_info or {}
+    schema = s.schema_info or {}
     fields = schema.get("fields", [])
 
     if not fields:
-        # 尝试从 connection_info 读取（PostgreSQL 等结构化源）
-        conn = source.connection_info or {}
-        if source.source_type == "postgresql" and "query" in conn:
-            # 简化实现：返回占位结果，实际应连接 DB 执行
+        conn = s.connection_info or {}
+        if s.source_type == "postgresql" and "query" in conn:
             return {
                 "source_id": str(source_id),
                 "status": "pending_implementation",
-                "message": "PostgreSQL 剖析需要数据库连接，参见连接器插件",
+                "message": "PostgreSQL profiling requires connector plugin",
                 "fields": [],
             }
         return {
             "source_id": str(source_id),
             "status": "no_schema",
-            "message": "源缺少 schema_info，请先上传或解析数据",
+            "message": "source has no schema_info, please upload first",
             "fields": [],
         }
 
-    # 对每个字段生成统计（基于 schema 推断类型 + 枚举）
     profiles: list[dict] = []
-    for field in fields[:50]:  # 最多50个字段
+    for field in fields[:50]:
         f_name = field.get("name", "")
         f_type = field.get("type", "string").lower()
-
         profile = {
             "field_name": f_name,
             "data_type": f_type,
@@ -730,22 +1248,17 @@ async def execute_field_profiling(
             "suggested_ontology_type": _infer_ontology_type(f_type, field),
             "suggested_property_type": _infer_property_type(f_type),
         }
-
-        # 检测枚举值
         if data.detect_enums:
             enum_vals = field.get("enum_values", [])
             if enum_vals:
                 profile["detected_enum_values"] = enum_vals[:50]
             elif profile["unique_ratio"] < 0.05 and profile["unique_count"] <= 50:
-                # 唯一值太少，视为枚举候选
                 profile["detected_enum_values"] = field.get("sample_values", [])[:50]
-
         profiles.append(profile)
 
-    # 更新 profiling run 状态
     run_result = await session.execute(
         select(ProfilingRun)
-        .where(ProfilingRun.source_id == source_id)
+        .where(ProfilingRun.source_id == s.id)
         .order_by(ProfilingRun.created_at.desc())
         .limit(1)
     )
@@ -767,7 +1280,6 @@ async def execute_field_profiling(
 
 
 def _infer_ontology_type(field_type: str, field: dict) -> str:
-    """推断建议的本体类IRI（根据数据特征）"""
     t = field_type.lower()
     if t in ("integer", "bigint", "smallint"):
         return "xsd:integer"
@@ -777,29 +1289,14 @@ def _infer_ontology_type(field_type: str, field: dict) -> str:
         return "xsd:boolean"
     if t in ("date", "datetime", "timestamp"):
         return "xsd:dateTime"
-    if t == "json":
-        return "xsd:string"
     return "xsd:string"
 
 
 def _infer_property_type(field_type: str) -> str:
-    """推断建议的属性类型"""
     t = field_type.lower()
-    if t in ("integer", "bigint", "smallint", "numeric", "decimal", "float", "double"):
-        return "datatype"
-    if t == "boolean":
-        return "datatype"
-    if t in ("date", "datetime", "timestamp"):
-        return "datatype"
-    if t in ("json", "text", "string"):
+    if t in (
+        "integer", "bigint", "smallint", "numeric", "decimal", "float", "double",
+        "boolean", "date", "datetime", "timestamp", "json", "text", "string",
+    ):
         return "datatype"
     return "datatype"
-
-
-# =====================================================================
-# 将子路由注册到主应用（通过 include_router）
-# sources.py 被 main.py 导入后，这部分通过 main.py 注册
-# =====================================================================
-# 注意：ev_router 和 prof_router 需在 main.py 中注册
-# 见 src/api/main.py
-

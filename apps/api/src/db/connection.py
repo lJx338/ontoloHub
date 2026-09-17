@@ -10,21 +10,32 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from src.core.config import settings
+from src.core.config import get_settings
 
 
-# Async engine (used by FastAPI runtime)
-_async_kwargs: dict = {
-    "echo": settings.database.echo,
-    "pool_pre_ping": True,
-}
-if not settings.database.url.startswith("sqlite"):
-    _async_kwargs.update(
-        pool_size=settings.database.pool_size,
-        max_overflow=settings.database.max_overflow,
-    )
+def _build_async_engine():
+    """Construct the async engine from the *current* settings.
 
-async_engine = create_async_engine(settings.database.url, **_async_kwargs)
+    Called per-request (factory) so that tests can monkeypatch
+    ``DATABASE_URL`` and observe the change. The engine/session
+    instances themselves are kept in module-level globals so that
+    FastAPI dependencies and Alembic share a single pool.
+    """
+    s = get_settings()
+    url = s.database.url
+    kwargs: dict = {
+        "echo": s.database.echo,
+        "pool_pre_ping": True,
+    }
+    if not url.startswith("sqlite"):
+        kwargs.update(
+            pool_size=s.database.pool_size,
+            max_overflow=s.database.max_overflow,
+        )
+    return create_async_engine(url, **kwargs)
+
+
+async_engine = _build_async_engine()
 
 # Async session factory
 async_session_factory = async_sessionmaker(
@@ -34,19 +45,23 @@ async_session_factory = async_sessionmaker(
     autoflush=False,
 )
 
-# Sync engine (used by Alembic migrations)
-_sync_url = settings.database.url
-for _drv in ("+asyncpg", "+aiosqlite"):
-    _sync_url = _sync_url.replace(_drv, "")
-_sync_kwargs: dict = {"echo": settings.database.echo}
-if not _sync_url.startswith("sqlite"):
-    _sync_kwargs.update(
-        pool_size=settings.database.pool_size,
-        max_overflow=settings.database.max_overflow,
-        pool_pre_ping=True,
-    )
 
-sync_engine = create_engine(_sync_url, **_sync_kwargs)
+def _build_sync_engine():
+    s = get_settings()
+    url = s.database.url
+    for drv in ("+asyncpg", "+aiosqlite"):
+        url = url.replace(drv, "")
+    kwargs: dict = {"echo": s.database.echo}
+    if not url.startswith("sqlite"):
+        kwargs.update(
+            pool_size=s.database.pool_size,
+            max_overflow=s.database.max_overflow,
+            pool_pre_ping=True,
+        )
+    return create_engine(url, **kwargs)
+
+
+sync_engine = _build_sync_engine()
 
 # Sync session factory
 sync_session_factory = sessionmaker(
@@ -54,6 +69,36 @@ sync_session_factory = sessionmaker(
     expire_on_commit=False,
     autoflush=False,
 )
+
+
+async def reinit_engines() -> None:
+    """Dispose the current engines and re-create them from current settings.
+
+    Tests call this after ``monkeypatch.setenv('DATABASE_URL', ...)`` to
+    pick up a new sqlite path. Production code shouldn't call this.
+    """
+    global async_engine, async_session_factory, sync_engine, sync_session_factory
+    try:
+        await async_engine.dispose()
+    except Exception:
+        pass
+    try:
+        sync_engine.dispose()
+    except Exception:
+        pass
+    async_engine = _build_async_engine()
+    async_session_factory = async_sessionmaker(
+        async_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autoflush=False,
+    )
+    sync_engine = _build_sync_engine()
+    sync_session_factory = sessionmaker(
+        sync_engine,
+        expire_on_commit=False,
+        autoflush=False,
+    )
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

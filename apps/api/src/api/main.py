@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from src.core.config import settings
 from src.db.connection import init_db, close_db
+from src.api.auth import ensure_bootstrap_admin
 
 
 @asynccontextmanager
@@ -15,6 +16,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """应用生命周期管理"""
     # 启动
     await init_db()
+    # 确保 bootstrap 管理员存在（HIA-51）。失败不阻断启动，但记录原因。
+    try:
+        await ensure_bootstrap_admin()
+    except Exception as exc:  # pragma: no cover — 不让启动被 DB 抖动阻断
+        import logging
+        logging.getLogger(__name__).warning(
+            "bootstrap admin failed: %s", exc
+        )
     yield
     # 关闭
     await close_db()
@@ -31,13 +40,21 @@ app = FastAPI(
     openapi_url="/api/openapi.json",
 )
 
-# 配置 CORS
+# 配置 CORS（HIA-51：允许前端/客户端通过自定义 header 传当前用户身份）
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.security.allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "X-User-Id",
+        "X-User-Email",
+        "X-User-Name",
+        "X-Request-Id",
+    ],
+    expose_headers=["X-Request-Id"],
 )
 
 
@@ -77,9 +94,10 @@ async def root() -> dict:
     }
 
 
-# 导入并注册路由
+# 业务路由
 from src.api import projects, ontologies, mappings, sources, proposals, catalog
 from src.api import candidates, validation
+from src.api import auth_api, users, members, audit
 
 app.include_router(projects.router)
 app.include_router(ontologies.router)
@@ -89,6 +107,12 @@ app.include_router(sources.router)
 app.include_router(proposals.router)
 app.include_router(candidates.router)
 app.include_router(validation.router)
+
+# HIA-51: 身份 / 成员 / 审计
+app.include_router(auth_api.router, prefix="/api")
+app.include_router(users.router, prefix="/api")
+app.include_router(members.router)
+app.include_router(audit.router)
 
 # Evidence 收件箱 / 剖析执行
 from src.api.sources import ev_router, prof_router
@@ -107,18 +131,22 @@ async def api_root() -> dict:
     return {
         "version": settings.api.version,
         "endpoints": {
-            "projects": "/api/projects",
-            "ontologies": "/api/ontologies",
-            "catalog": "/api/catalog",
-            "mappings": "/api/mappings",
-            "sources": "/api/sources",
-            "proposals": "/api/proposals",
-            "candidates": "/api/candidates",
-            "validation": "/api/validation",
-            "evidences": "/api/evidences",
-            "profiling": "/api/profiling",
-            "releases": "/api/releases",
-            "change_requests": "/api/change-requests",
-            "deployments": "/api/deployments",
+            "projects": "/projects",
+            "ontologies": "/ontologies",
+            "catalog": "/catalog",
+            "mappings": "/mappings",
+            "sources": "/sources",
+            "proposals": "/proposals",
+            "candidates": "/candidates",
+            "validation": "/validation",
+            "evidences": "/evidences",
+            "profiling": "/profiling",
+            "releases": "/releases",
+            "change_requests": "/change-requests",
+            "deployments": "/deployments",
+            "users": "/api/users",
+            "members": "/projects/{id}/members",
+            "audit": "/projects/{id}/audit",
+            "audit_verify": "/audit/verify",
         },
     }

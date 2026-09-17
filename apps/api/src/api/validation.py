@@ -540,6 +540,165 @@ def _compare_outputs(expected: dict, actual: dict) -> bool:
 
 
 # =====================================================================
+# SHACL 校验路由（HIA-73）
+# =====================================================================
+
+
+class SHACLValidateRequest(BaseModel):
+    """直接用 SHACL Turtle 形状校验对象数据。"""
+    shapes_ttl: str = Field(..., description="SHACL Turtle 形状文本")
+    objects: list[dict] = Field(..., description="待校验的对象列表")
+    namespace_base: str = Field(
+        default="http://ontolohub/data/",
+        description="对象 IRI 的命名空间前缀",
+    )
+
+
+class SHACLValidateFromOntologyRequest(BaseModel):
+    """从本体（类/属性/约束）构建形状后校验对象数据。"""
+    ontology_version_id: uuid.UUID = Field(..., description="本体版本 ID")
+    classes: list[dict] = Field(..., description="本体类列表")
+    properties: list[dict] = Field(..., description="属性列表")
+    constraints: list[dict] = Field(..., description="约束列表")
+    objects: list[dict] = Field(..., description="待校验的对象列表")
+    namespace_base: str = Field(
+        default="http://ontolohub/data/",
+        description="对象 IRI 的命名空间前缀",
+    )
+
+
+class SHACLPreviewShapesRequest(BaseModel):
+    """预览从本体生成的 SHACL Turtle 形状。"""
+    classes: list[dict]
+    properties: list[dict]
+    constraints: list[dict]
+
+
+class SHACLViolationResponse(BaseModel):
+    focus_node: str
+    result_path: Optional[str]
+    message: str
+    severity: str
+    source_shape: str
+    constraint_type: str
+
+
+class SHACLValidationResponse(BaseModel):
+    conforms: bool
+    violations: list[SHACLViolationResponse]
+    violation_count: int
+    blocking_count: int
+    checked_objects: int
+    checked_shapes: int
+    duration_ms: int
+    errors: list[str]
+
+    model_config = {"from_attributes": True}
+
+
+@router.post("/shacl/validate", response_model=SHACLValidationResponse)
+async def shacl_validate(
+    data: SHACLValidateRequest,
+) -> SHACLValidationResponse:
+    """直接用 SHACL Turtle 形状对对象列表执行 SHACL 校验（HIA-73）。
+
+    - 分块执行（每批 500 条），支持大数据集。
+    - shapes_ttl 支持标准 SHACL 1.1 全部约束predicate。
+    - 结果包含 violations / conforms / 统计 / 耗时。
+    """
+    from src.services.shacl import validate
+
+    result = validate(
+        objects=data.objects,
+        ontology_version_id="direct",
+        shapes_ttl=data.shapes_ttl,
+        namespace_base=data.namespace_base,
+    )
+    return SHACLValidationResponse(
+        conforms=result.conforms,
+        violations=[
+            SHACLViolationResponse(
+                focus_node=v.focus_node,
+                result_path=v.result_path,
+                message=v.message,
+                severity=v.severity,
+                source_shape=v.source_shape,
+                constraint_type=v.constraint_type,
+            )
+            for v in result.violations
+        ],
+        violation_count=result.violation_count,
+        blocking_count=len(result.blocking_violations),
+        checked_objects=result.checked_objects,
+        checked_shapes=result.checked_shapes,
+        duration_ms=result.duration_ms,
+        errors=result.errors,
+    )
+
+
+@router.post("/shacl/validate-from-ontology", response_model=SHACLValidationResponse)
+async def shacl_validate_from_ontology(
+    data: SHACLValidateFromOntologyRequest,
+) -> SHACLValidationResponse:
+    """从本体类/属性/约束构建 SHACL 形状，对对象列表执行校验（HIA-73）。
+
+    内部会：
+    1. 将本体数据转换为 SHACL Turtle 形状文本（带 shape 缓存）。
+    2. 将对象列表转为 RDF Graph。
+    3. 调用 pyshacl.validate() 执行校验。
+    4. 解析违规结果返回。
+    """
+    from src.services.shacl import validate_ontology_data
+
+    result = validate_ontology_data(
+        objects=data.objects,
+        ontology_version_id=str(data.ontology_version_id),
+        classes=data.classes,
+        properties=data.properties,
+        constraints=data.constraints,
+        namespace_base=data.namespace_base,
+    )
+    return SHACLValidationResponse(
+        conforms=result.conforms,
+        violations=[
+            SHACLViolationResponse(
+                focus_node=v.focus_node,
+                result_path=v.result_path,
+                message=v.message,
+                severity=v.severity,
+                source_shape=v.source_shape,
+                constraint_type=v.constraint_type,
+            )
+            for v in result.violations
+        ],
+        violation_count=result.violation_count,
+        blocking_count=len(result.blocking_violations),
+        checked_objects=result.checked_objects,
+        checked_shapes=result.checked_shapes,
+        duration_ms=result.duration_ms,
+        errors=result.errors,
+    )
+
+
+@router.post("/shacl/preview-shapes")
+async def shacl_preview_shapes(
+    data: SHACLPreviewShapesRequest,
+) -> dict:
+    """预览从本体数据生成的 SHACL Turtle 形状文本（HIA-73）。
+
+    用于在提交校验前确认形状是否符合预期。
+    """
+    from src.services.shacl import build_shapes_from_ontology
+
+    ttl = build_shapes_from_ontology(
+        classes=data.classes,
+        properties=data.properties,
+        constraints=data.constraints,
+    )
+    return {"ttl": ttl}
+
+
+# =====================================================================
 # 保存的查询路由
 # =====================================================================
 

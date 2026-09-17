@@ -36,6 +36,10 @@ ontoloHub/
 │   └── core/         # 跨包共享的 Python 工具
 ├── scripts/          # 安装、启动、清理、补丁
 ├── docs/             # 架构说明、API 文档、roadmap
+│   ├── ARCHITECTURE.md
+│   ├── DEVELOPMENT.md     # 开发规范 + 避坑指南（必读）
+│   ├── MILESTONES.md
+│   └── ...
 ├── install.ps1       # Windows 原生安装（推荐 PowerShell 5.1+）
 ├── install.sh        # macOS / Linux 原生安装
 ├── package.json      # npm workspaces 根

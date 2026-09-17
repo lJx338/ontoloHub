@@ -16,7 +16,7 @@ from sqlalchemy import engine_from_config, pool
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.core.config import settings  # noqa: E402
+from src.core.config import get_settings  # noqa: E402
 from src.db.base import Base  # noqa: E402
 from src.db import models  # noqa: F401, E402  # 导入所有模型注册到 Base.metadata
 
@@ -24,7 +24,9 @@ config = context.config
 
 # 注入数据库 URL（env.py 优先级高于 alembic.ini）。
 # Alembic 走同步引擎，剥掉 async 驱动前缀（+asyncpg / +aiosqlite）。
-_db_url = settings.database.url
+# 使用 ``get_settings()`` 而不是模块级 ``settings``，确保测试 monkeypatch
+# DATABASE_URL 后能读到最新值。
+_db_url = get_settings().database.url
 for _async_drv in ("+asyncpg", "+aiosqlite"):
     _db_url = _db_url.replace(_async_drv, "")
 config.set_main_option("sqlalchemy.url", _db_url)

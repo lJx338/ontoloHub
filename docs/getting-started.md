@@ -121,3 +121,5 @@ A：M1 之前的过渡方案：装个本地 PG（`docker run -d -p 5432:5432 -e 
 ## 下一步
 
 读完 [`docs/architecture.md`](architecture.md) 了解分层，然后从 Linear 项目 [OntoloHub](https://linear.app/hiatt/project/ontolohub-a82602909d16) 选一张卡开搞。
+
+> 写新端点 / 改 schema 前，先看一遍 [`docs/DEVELOPMENT.md`](DEVELOPMENT.md) 的 §2 / §3 / §6，里面列的坑都在这个仓库里真实发生过。
