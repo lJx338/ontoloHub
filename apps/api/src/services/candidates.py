@@ -2,9 +2,13 @@
 
 从数据源字段剖析结果自动生成本体类/属性提案。
 支持规则基础和 LLM 增强两种模式（LLM 部分预留接口）。
+HIA-72: Redis 缓存 field profiles 和 aligned_iris 集合。
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import uuid
 import re
 from typing import Optional
@@ -20,6 +24,97 @@ from src.db.candidate import (
     ConfidenceLevel,
 )
 from src.db.ontology import OntologyClass
+
+# ---------------------------------------------------------------------------
+# Redis 缓存 helpers（HIA-72）
+# ---------------------------------------------------------------------------
+
+_FIELD_PROFILE_TTL = 120   # field profile 缓存 TTL：2 分钟
+_ALIGNED_IRIS_TTL = 300    # aligned_iris 集合缓存 TTL：5 分钟
+
+
+async def _get_aligned_iris_set_cached(
+    session: AsyncSession,
+    source_id: uuid.UUID,
+) -> set[str]:
+    """获取源已对齐的 ontology_class_iri 集合，支持 Redis 缓存（HIA-72）。
+
+    缓存命中时直接返回；未命中则从 DB 查询并写入 Redis。
+    Redis 不可用时降级为直接查 DB。
+    """
+    cache_key = f"candidates:aligned_iris:{source_id}"
+    try:
+        from src.core.cache import CacheUnavailable, get_cache
+        cache = await get_cache()
+        cached = await cache.get_json("candidates", cache_key)
+        if cached is not None:
+            return set(cached)
+    except Exception:
+        pass  # Redis 不可用，降级到 DB
+
+    # 缓存未命中，从 DB 查
+    aligned_iris: set[str] = set()
+    ev_result = await session.execute(
+        select(Evidence).where(
+            Evidence.source_id == source_id,
+            Evidence.is_confirmed == True,
+            Evidence.ontology_class_iri.isnot(None),
+        )
+    )
+    for ev in ev_result.scalars().all():
+        if ev.ontology_class_iri:
+            aligned_iris.add(ev.ontology_class_iri)
+
+    # 写 Redis 缓存（静默失败）
+    try:
+        from src.core.cache import get_cache
+        cache = await get_cache()
+        await cache.set_json(
+            "candidates",
+            cache_key,
+            list(aligned_iris),
+            ttl=_ALIGNED_IRIS_TTL,
+        )
+    except Exception:
+        pass
+
+    return aligned_iris
+
+
+def _field_profile_cache_key(field: dict) -> str:
+    """基于字段内容计算稳定哈希作为缓存 key。"""
+    sig = json.dumps(field, sort_keys=True, default=str)
+    return hashlib.sha256(sig.encode()).hexdigest()[:16]
+
+
+async def _get_field_profile_cached(field: dict) -> Optional[dict]:
+    """从 Redis 缓存读取 field profile（JSON 反序列化）。
+
+    Returns None 表示缓存未命中或 Redis 不可用。
+    """
+    cache_key = _field_profile_cache_key(field)
+    try:
+        from src.core.cache import get_cache
+        cache = await get_cache()
+        return await cache.get_json("candidates", f"field_profile:{cache_key}")
+    except Exception:
+        return None
+
+
+async def _cache_field_profile(field: dict, profile: dict) -> None:
+    """将 field profile 写入 Redis 缓存（静默失败）。"""
+    cache_key = _field_profile_cache_key(field)
+    try:
+        from src.core.cache import get_cache
+        cache = await get_cache()
+        await cache.set_json(
+            "candidates",
+            f"field_profile:{cache_key}",
+            profile,
+            ttl=_FIELD_PROFILE_TTL,
+        )
+    except Exception:
+        pass
 
 
 # =====================================================================
@@ -260,18 +355,8 @@ async def generate_candidates_from_profiling(
             field_profiles=[],
         )
 
-    # 2. 读取已有对齐（避免重复提案）
-    aligned_iris = set()
-    ev_result = await session.execute(
-        select(Evidence).where(
-            Evidence.source_id == source_id,
-            Evidence.is_confirmed == True,
-            Evidence.ontology_class_iri.isnot(None),
-        )
-    )
-    for ev in ev_result.scalars().all():
-        if ev.ontology_class_iri:
-            aligned_iris.add(ev.ontology_class_iri)
+    # 2. 读取已有对齐（避免重复提案）— 优先从 Redis 缓存读
+    aligned_iris = await _get_aligned_iris_set_cached(session, source_id)
 
     created = 0
     skipped = 0
@@ -279,8 +364,23 @@ async def generate_candidates_from_profiling(
 
     for field in fields[:batch_size]:
         f_name = field.get("name", "")
-        f_type = _classify_field_type(field)
-        confidence_score, confidence_level = _compute_confidence(field, f_type)
+
+        # 3. 尝试从 Redis 缓存读取 field profile（HIA-72）
+        cached_profile = await _get_field_profile_cached(field)
+        if cached_profile is not None:
+            f_type = cached_profile["inferred_type"]
+            confidence_score = cached_profile["confidence"]
+            confidence_level = ConfidenceLevel(cached_profile["confidence_level"])
+        else:
+            f_type = _classify_field_type(field)
+            confidence_score, confidence_level = _compute_confidence(field, f_type)
+            profile_dict = {
+                "field_name": f_name,
+                "inferred_type": f_type,
+                "confidence": confidence_score,
+                "confidence_level": confidence_level.value,
+            }
+            await _cache_field_profile(field, profile_dict)
 
         profile = {
             "field_name": f_name,

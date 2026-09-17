@@ -608,7 +608,7 @@ async def shacl_validate(
     """
     from src.services.shacl import validate
 
-    result = validate(
+    result = await validate(
         objects=data.objects,
         ontology_version_id="direct",
         shapes_ttl=data.shapes_ttl,
@@ -650,7 +650,7 @@ async def shacl_validate_from_ontology(
     """
     from src.services.shacl import validate_ontology_data
 
-    result = validate_ontology_data(
+    result = await validate_ontology_data(
         objects=data.objects,
         ontology_version_id=str(data.ontology_version_id),
         classes=data.classes,

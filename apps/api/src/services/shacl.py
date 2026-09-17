@@ -3,11 +3,13 @@
 - 将 OntologyConstraint 模型转换为标准 SHACL Turtle 形状文件。
 - 用 pyshacl 执行校验，返回结构化违规清单。
 - 支持自定义约束组件：ontolohub:RowCount / ontolohub:RegexPattern / ontolohub:InValueSet。
-- 按 ontology_version_id 缓存已编译的形状，避免重复解析。
+- 按 ontology_version_id 缓存已编译的形状（Redis），避免重复解析。
 - 大数据集自动分块（CHUNK_SIZE 条对象一个批次）。
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import re
 import uuid
@@ -20,6 +22,8 @@ from pyshacl import validate as _pyshacl_validate
 from pyshacl.constraints import ConstraintComponent
 from rdflib import FOAF, OWL, RDF, RDFS, XSD, Namespace, URIRef, Graph
 from rdflib.term import Identifier
+
+from src.core.cache import CacheUnavailable, get_cache
 
 logger = logging.getLogger(__name__)
 
@@ -279,23 +283,54 @@ def _normalize_severity(severity: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 形状缓存（LRU，按 ontology_version_id）
+# 形状缓存（Redis，按 ontology_version_id）
 # ---------------------------------------------------------------------------
 
-_SHAPE_CACHE: dict[str, Graph] = {}
-_MAX_CACHE_SIZE = 64  # 最多缓存 64 个 ontology 版本
+_SHAPE_TTL = 300  # 形状缓存 TTL：5 分钟
 
 
-def _get_cached_shapes(version_id: str) -> Graph | None:
-    return _SHAPE_CACHE.get(version_id)
+async def _get_cached_shapes_graph(version_id: str) -> Optional[Graph]:
+    """从 Redis 读取已缓存的 shapes Graph（反序列化 TTLGraph）。
+
+    Returns None 表示缓存未命中或 Redis 不可用（调用方回退到重新解析）。
+    """
+    try:
+        cache = await get_cache()
+        raw = await cache.get("shapes", version_id)
+        if raw is None:
+            return None
+        g = Graph()
+        g.parse(data=raw, format="turtle")
+        logger.debug("SHACL shapes cache HIT for version_id=%s", version_id)
+        return g
+    except CacheUnavailable:
+        logger.debug("SHACL shapes cache MISS (Redis unavailable) for version_id=%s", version_id)
+        return None
+    except Exception as exc:
+        logger.warning("SHACL shapes cache read failed for %s: %s", version_id, exc)
+        return None
 
 
-def _cache_shapes(version_id: str, graph: Graph) -> None:
-    if len(_SHAPE_CACHE) >= _MAX_CACHE_SIZE:
-        # FIFO 淘汰最老的
-        oldest = next(iter(_SHAPE_CACHE))
-        del _SHAPE_CACHE[oldest]
-    _SHAPE_CACHE[version_id] = graph
+async def _cache_shapes_graph(version_id: str, shapes_ttl: str) -> None:
+    """将 shapes TTL 文本写入 Redis 缓存。失败不阻断（静默降级）。"""
+    try:
+        cache = await get_cache()
+        await cache.set("shapes", version_id, shapes_ttl, ttl=_SHAPE_TTL)
+        logger.debug("SHACL shapes cached for version_id=%s, ttl=%ds", version_id, _SHAPE_TTL)
+    except CacheUnavailable:
+        pass  # 降级：无缓存继续执行
+    except Exception as exc:
+        logger.warning("SHACL shapes cache write failed for %s: %s", version_id, exc)
+
+
+def _get_cached_shapes(version_id: str) -> Optional[Graph]:  # 同步占位，保留给 validate() 兼容
+    """同步保留：实际由 async _get_cached_shapes_graph 处理。"""
+    return None
+
+
+def _cache_shapes(version_id: str, graph: Graph) -> None:  # 同步占位
+    """同步保留：实际由 async _cache_shapes_graph 处理。"""
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +413,7 @@ def _add_value_to_graph(g: Graph, subject: Identifier, predicate: Identifier, va
 CHUNK_SIZE = 500  # 每批处理多少条对象
 
 
-def validate(
+async def validate(
     objects: list[dict],
     *,
     ontology_version_id: str,
@@ -388,6 +423,7 @@ def validate(
     """对一组对象运行 SHACL 校验。
 
     使用 pyshacl.validate()，通过已生成的 shapes_ttl 形状文件校验对象。
+    形状 Graph 按 ontology_version_id 缓存到 Redis（TTL 5 分钟）。
 
     Args:
         objects:               对象字典列表
@@ -402,14 +438,15 @@ def validate(
 
     t0 = time.monotonic()
 
-    # ---- 尝试从缓存读取形状 Graph ----
-    cached = _get_cached_shapes(ontology_version_id)
+    # ---- 尝试从 Redis 缓存读取形状 Graph ----
+    cached = await _get_cached_shapes_graph(ontology_version_id)
     if cached is not None:
         shapes_graph = cached
     else:
         shapes_graph = Graph()
         shapes_graph.parse(data=shapes_ttl, format="turtle")
-        _cache_shapes(ontology_version_id, shapes_graph)
+        # 异步写入 Redis 缓存（不阻塞主流程）
+        asyncio.create_task(_cache_shapes_graph(ontology_version_id, shapes_ttl))
 
     # ---- 从形状中提取 property_iri_map（sh:path local → 完整 IRI）----
     property_iri_map = _extract_property_iri_map(shapes_graph)
@@ -608,7 +645,7 @@ def build_shapes_from_ontology(
     return "\n".join(all_lines)
 
 
-def validate_ontology_data(
+async def validate_ontology_data(
     objects: list[dict],
     ontology_version_id: str,
     classes: list[dict],
@@ -618,7 +655,7 @@ def validate_ontology_data(
 ) -> ValidationResult:
     """一站式：从本体数据生成形状 + 对对象执行 SHACL 校验。"""
     shapes_ttl = build_shapes_from_ontology(classes, properties, constraints)
-    return validate(
+    return await validate(
         objects,
         ontology_version_id=ontology_version_id,
         shapes_ttl=shapes_ttl,

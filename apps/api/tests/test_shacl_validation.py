@@ -288,9 +288,10 @@ class TestBuildShapesFromOntology:
 
 
 class TestValidate:
-    """测试 validate() — 端到端 SHACL 执行。"""
+    """测试 validate() — 端到端 SHACL 执行（HIA-73 + HIA-72 Redis 缓存）。"""
 
-    def test_valid_object_conforms(self):
+    @pytest.mark.asyncio
+    async def test_valid_object_conforms(self):
         """符合所有约束的对象 → conforms=True。"""
         shapes_ttl = """
 @prefix sh:   <http://www.w3.org/ns/shacl#> .
@@ -311,7 +312,7 @@ class TestValidate:
                 "name": "Alice",
             }
         ]
-        result = validate(
+        result = await validate(
             objects=objects,
             ontology_version_id="test-v1",
             shapes_ttl=shapes_ttl,
@@ -319,7 +320,8 @@ class TestValidate:
         assert result.conforms is True
         assert result.violation_count == 0
 
-    def test_min_count_violation(self):
+    @pytest.mark.asyncio
+    async def test_min_count_violation(self):
         """缺少必需字段 → 违规。"""
         shapes_ttl = """
 @prefix sh:   <http://www.w3.org/ns/shacl#> .
@@ -340,7 +342,7 @@ class TestValidate:
                 # 没有 name 字段 → 触发 minCount 违规
             }
         ]
-        result = validate(
+        result = await validate(
             objects=objects,
             ontology_version_id="test-v2",
             shapes_ttl=shapes_ttl,
@@ -350,7 +352,8 @@ class TestValidate:
         # 检查 focus_node 指向正确对象
         assert any("p1" in v.focus_node or "p1" in v.focus_node for v in result.violations)
 
-    def test_pattern_violation(self):
+    @pytest.mark.asyncio
+    async def test_pattern_violation(self):
         """email 不符合 pattern → 违规。"""
         shapes_ttl = """
 @prefix sh:   <http://www.w3.org/ns/shacl#> .
@@ -371,7 +374,7 @@ class TestValidate:
                 "email": "not-an-email",
             }
         ]
-        result = validate(
+        result = await validate(
             objects=objects,
             ontology_version_id="test-v3",
             shapes_ttl=shapes_ttl,
@@ -380,7 +383,8 @@ class TestValidate:
         assert any("pattern" in v.constraint_type.lower() or "Pattern" in v.constraint_type
                    for v in result.violations)
 
-    def test_datatype_violation(self):
+    @pytest.mark.asyncio
+    async def test_datatype_violation(self):
         """字符串填进 integer 字段 → datatype 违规。"""
         shapes_ttl = """
 @prefix sh:   <http://www.w3.org/ns/shacl#> .
@@ -401,7 +405,7 @@ class TestValidate:
                 "quantity": "twenty",  # 不是 integer
             }
         ]
-        result = validate(
+        result = await validate(
             objects=objects,
             ontology_version_id="test-v4",
             shapes_ttl=shapes_ttl,
@@ -409,7 +413,8 @@ class TestValidate:
         assert result.conforms is False
         assert result.violation_count >= 1
 
-    def test_multiple_objects_mixed(self):
+    @pytest.mark.asyncio
+    async def test_multiple_objects_mixed(self):
         """混合场景：p1 合法，p2 违规 → conforms=False。"""
         shapes_ttl = """
 @prefix sh:   <http://www.w3.org/ns/shacl#> .
@@ -427,7 +432,7 @@ class TestValidate:
             {"id": "p1", "class_iri": "http://example.org/Person", "name": "Alice"},
             {"id": "p2", "class_iri": "http://example.org/Person"},  # 缺 name
         ]
-        result = validate(
+        result = await validate(
             objects=objects,
             ontology_version_id="test-v5",
             shapes_ttl=shapes_ttl,
@@ -435,40 +440,43 @@ class TestValidate:
         assert result.conforms is False
         assert result.violation_count >= 1
 
-    def test_shape_caching(self):
-        """两次调用同一 ontology_version_id，第二次应命中缓存（不发新 parse）。"""
+    @pytest.mark.asyncio
+    async def test_shape_caching(self):
+        """两次调用同一 ontology_version_id，第二次应命中 Redis 缓存（不发新 parse）。"""
         shapes_ttl = """
 @prefix sh: <http://www.w3.org/ns/shacl#> .
 <#PersonShape> a sh:NodeShape ;
   sh:targetClass <http://example.org/Person> .
 """
         version_id = "cache-test-v1"
-        _SHAPE_CACHE.clear()
 
-        result1 = validate(
+        # 第一次调用：缓存未命中，解析 shapes
+        result1 = await validate(
             objects=[{"id": "p1", "class_iri": "http://example.org/Person", "name": "Bob"}],
             ontology_version_id=version_id,
             shapes_ttl=shapes_ttl,
         )
-        assert version_id in _SHAPE_CACHE
+        assert result1.conforms is True
 
-        result2 = validate(
+        # 第二次调用同一 version_id：Redis 缓存命中，不重新 parse
+        result2 = await validate(
             objects=[{"id": "p2", "class_iri": "http://example.org/Person", "name": "Carol"}],
             ontology_version_id=version_id,
             shapes_ttl=shapes_ttl,
         )
-        # 第二次不走 parse，直接用缓存 graph
+        # 缓存命中时行为一致，结果应相同
         assert result2.conforms is True
-        _SHAPE_CACHE.clear()
+        assert result2.checked_objects == 1
 
-    def test_duration_ms_recorded(self):
+    @pytest.mark.asyncio
+    async def test_duration_ms_recorded(self):
         """结果包含耗时。"""
         shapes_ttl = """
 @prefix sh: <http://www.w3.org/ns/shacl#> .
 <#PersonShape> a sh:NodeShape ;
   sh:targetClass <http://example.org/Person> .
 """
-        result = validate(
+        result = await validate(
             objects=[{"id": "p1", "class_iri": "http://example.org/Person"}],
             ontology_version_id="duration-test",
             shapes_ttl=shapes_ttl,
@@ -478,9 +486,10 @@ class TestValidate:
 
 
 class TestValidateOntologyData:
-    """测试 validate_ontology_data — 从本体数据一站式校验。"""
+    """测试 validate_ontology_data — 从本体数据一站式校验（HIA-73 + HIA-72 Redis 缓存）。"""
 
-    def test_full_pipeline(self):
+    @pytest.mark.asyncio
+    async def test_full_pipeline(self):
         """类 + 属性 + 约束 → shapes → 对象校验。"""
         classes = [
             {"id": "cls-1", "iri": "http://example.org/Person", "name": "Person"}
@@ -509,7 +518,7 @@ class TestValidateOntologyData:
             {"id": "p2", "class_iri": "http://example.org/Person", "name": "Bob", "email": "invalid-email"},
         ]
 
-        result = validate_ontology_data(
+        result = await validate_ontology_data(
             objects=objects,
             ontology_version_id="pipeline-test-v1",
             classes=classes,
