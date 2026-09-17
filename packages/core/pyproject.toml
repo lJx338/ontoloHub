@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ontolohub-core"
+version = "0.1.0"
+description = "OntoloHub 跨包共享工具（占位 — A1 阶段为空）"
+requires-python = ">=3.11"
+authors = [{ name = "OntoloHub Team" }]
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+# 把 src 当作单一包根目录
+packages = ["src"]

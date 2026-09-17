@@ -1,0 +1,58 @@
+# OntoloHub 本地开发编排
+#
+# 启动：   docker compose up -d
+# 看日志： docker compose logs -f api
+# 停掉：   docker compose down
+# 重置：   docker compose down -v   （同时清空数据卷）
+#
+# 服务：
+#   - postgres: PostgreSQL 16 主库
+#   - api:      FastAPI 后端，自动跑 Alembic 迁移
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ontolohub-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ontolohub
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ontolohub"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ontolohub-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/ontolohub
+      DATABASE_ECHO: "false"
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      API_DEBUG: "false"
+      LOG_LEVEL: INFO
+      LOG_FORMAT: text
+    ports:
+      - "8000:8000"
+    volumes:
+      # 源码挂载，容器内 reload 不用 rebuild
+      - ./src:/app/src
+      - ./alembic:/app/alembic
+      - ./scripts:/app/scripts
+
+volumes:
+  postgres_data:
+    name: ontolohub_postgres_data

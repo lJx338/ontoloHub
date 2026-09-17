@@ -1,0 +1,39 @@
+[project]
+name = "ontolohub"
+version = "0.1.0"
+description = "OntoloHub — 本体工程与语义应用工作台（Monorepo root）"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "OntoloHub Team" },
+]
+
+# 此 pyproject 仅作为 monorepo 根元数据；真正的可安装包在 apps/* 与 packages/* 下。
+# 开发期请用：
+#   python -m venv venv
+#   source venv/bin/activate   (Windows: venv\Scripts\activate)
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   pip install -e apps/api -e apps/cli -e packages/core
+#
+# M1 之后将迁到 uv workspace；HIA-50 阶段先用 venv + pip 跑通。
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["apps", "packages"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+warn_return_any = true
+warn_unused_ignores = true
+mypy_path = "apps/api/src:apps/cli/src:packages/core/src"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["apps/api/tests"]
+addopts = "-ra -q"

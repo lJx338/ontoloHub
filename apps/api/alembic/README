@@ -1,0 +1,23 @@
+# Alembic migrations
+
+手工维护的迁移目录。
+
+迁移版本表 `alembic_version` 由 Alembic 自动管理。
+
+常用命令：
+
+```bash
+# 生成新迁移（基于 Base.metadata 自检）
+alembic revision --autogenerate -m "message"
+
+# 应用所有迁移
+alembic upgrade head
+
+# 回滚一个版本
+alembic downgrade -1
+
+# 比对代码与数据库
+alembic check
+```
+
+数据库连接 URL 从 `src.core.config.settings` 注入，无需修改 `alembic.ini`。

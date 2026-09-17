@@ -1,0 +1,35 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 本地开发环境
+.venv/
+venv/
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 日志 / 临时
+*.log
+*.tmp
+
+# 文档 / 原型
+docs/
+prototype/
+*.md
+LICENSE
+
+# 数据卷挂载点
+data/

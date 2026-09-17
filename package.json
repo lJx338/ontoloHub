@@ -1,0 +1,26 @@
+{
+  "name": "ontolohub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OntoloHub monorepo root (Node workspaces for the web app and tooling).",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:web": "npm --workspace @ontolohub/web run dev",
+    "dev:api": "cd apps/api && python -m uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000",
+    "build": "npm --workspace @ontolohub/web run build",
+    "lint": "npm --workspace @ontolohub/web run lint",
+    "test": "npm --workspace @ontolohub/web run lint --silent",
+    "clean": "node scripts/clean.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
+  "devDependencies": {
+    "npm-run-all2": "^6.2.6"
+  }
+}
