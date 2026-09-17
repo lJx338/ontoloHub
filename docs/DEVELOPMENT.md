@@ -367,6 +367,75 @@ except CacheUnavailable:
 再 ``await cache_mod.reset_cache()``。monkeypatch `_build_pool` 时尤其重要，
 否则 fake 客户端永远装不到单例上。
 
+### 6.16 把同步函数改成异步后，所有调用方都得改
+
+**症状**：把 `def validate(...)` 改成 `async def validate(...)` 之后，路由
+handler / 测试 / 内部调用忘了加 `await`，报 `'coroutine' object has no attribute ...`。
+
+**原因**：Python async 改造不是类型签名变一下就完 — 调用方必须 `await`，包括：
+路由 handler（已经是 async，加 `await` 即可），**测试方法**（要改成 `async def` +
+`@pytest.mark.asyncio`），**任何同步工具函数**（如果它会调到这个函数，自己也得
+变成 async）。
+
+**规避**：
+
+1. 改函数前先 `Grep` 全文 `func_name(` 找出所有调用点。
+2. 路由 handler：加 `await`。
+3. 测试：`def` → `async def`，加 `@pytest.mark.asyncio`。
+4. 第三方库同步 API 包了异步函数时，用 `asyncio.to_thread(...)`。
+5. 改完跑完整测试套件，不要只跑你改的那个测试文件 — 调用链上的别处也会炸。
+
+### 6.17 缓存 helper 写进 dict / set 的 key 时要做 hash
+
+**症状**：把整个 `field` dict 直接拼进 cache key（如
+`f"profile:{field}"`），结果 key 长到 Redis 报警，或被截断导致不同 field 撞 key。
+
+**原因**：dict 的 `repr()` 包含空格、换行、Unicode 转义，长度不可控；两个 dict
+字段顺序不同但内容相同也 `repr` 出不同 key。
+
+**规避**：用稳定的哈希作为 key 片段：
+
+```python
+import hashlib, json
+
+def _cache_key(d: dict) -> str:
+    sig = json.dumps(d, sort_keys=True, default=str)   # sort_keys 决定稳定性
+    return hashlib.sha256(sig.encode()).hexdigest()[:16]
+```
+
+TTL 写短一点（120s），反正缓存内容下次重算成本低；写太长一旦业务改了字段定义，
+旧 cache 会一直返回错的结果。
+
+### 6.18 `asyncio.create_task` 在测试同步上下文里静默丢弃
+
+**症状**：路由里 `asyncio.create_task(_cache_shapes_graph(...))` 把缓存写入
+fire-and-forget，集成测试跑完后 Redis 里啥也没有，单元测试拿不到缓存结果。
+
+**原因**：FastAPI lifespan 启动的事件循环里 `create_task` 才会被调度；测试里
+ASGITransport 跑完同步退事件循环，未调度的 task 直接被 GC。
+
+**规避**：
+
+- 缓存写入走 `await _cache_shapes_graph(...)` — 业务等得起 5ms 网络 IO。
+- 非要 fire-and-forget 的话，确保调用方还在事件循环里运行（FastAPI 路由里 OK，
+  但单测要保留 loop 到 task 完成）。
+- 或者把"写缓存"做成 best-effort 装饰器，捕获所有异常 + 记 WARNING。
+
+### 6.19 Alembic autogenerate 误带无关字段
+
+**症状**：`alembic revision --autogenerate` 生成的 migration 把全表所有列都
+列了一遍（包括没改过的），review 时 diff 巨大、merge conflict 多。
+
+**原因**：本地 SQLite schema 和生产 PG schema 元数据有微妙差异（enum 顺序、
+index 顺序、CHECK 约束名等），autogenerate 会忠实地把它们全 dump 出来。
+
+**规避**：
+
+- autogenerate 是**起点**，跑完 diff 后人工审一遍，把无关行删掉。
+- 写 `include_object` 过滤器只挑改了的表。
+- 如果 diff 大到没法审，宁可手写迁移：加列就是 `op.add_column(...)` + index，
+别让 autogenerate 全包。
+
 ---
 
 ## 7. 工具链 / 环境陷阱
@@ -560,6 +629,62 @@ async def fake_cache(monkeypatch):
 | `REDIS_SOCKET_TIMEOUT` | `2.0` | 读写 socket 超时（秒） |
 | `REDIS_CONNECT_TIMEOUT` | `2.0` | 连接握手超时（秒） |
 | `REDIS_KEY_PREFIX` | `ontolohub` | 全局前缀，多服务防串 |
+
+### 10.6 缓存 wiring 模板
+
+把 Redis 缓存接入已有 service 时，推荐三段式：
+
+```python
+# src/services/<domain>.py
+
+import hashlib, json
+from src.core.cache import get_cache, CacheUnavailable
+
+_TTL_PROFILE = 120      # 短：业务字段定义可能变
+_TTL_LIST = 300         # 中：列表 / 聚合结果
+_TTL_HEAVY = 1800       # 长：expensive 解析（SHACL shapes 等）
+
+async def _cache_get_json(ns: str, key: str):
+    try:
+        cache = await get_cache()
+        return await cache.get_json(ns, key)
+    except CacheUnavailable:
+        return None                # 降级：cache miss
+
+async def _cache_set_json(ns: str, key: str, value, *, ttl: int):
+    try:
+        cache = await get_cache()
+        await cache.set_json(ns, key, value, ttl=ttl)
+    except CacheUnavailable:
+        pass                       # 降级：静默
+
+
+async def heavy_compute(field: dict) -> dict:
+    """缓存包裹：先查 Redis，miss 再算再回写。"""
+    sig = hashlib.sha256(
+        json.dumps(field, sort_keys=True, default=str).encode()
+    ).hexdigest()[:16]
+    cache_key = f"profile:{sig}"
+
+    cached = await _cache_get_json("my_domain", cache_key)
+    if cached is not None:
+        return cached
+
+    result = _do_compute(field)              # 同步纯函数
+    await _cache_set_json("my_domain", cache_key, result, ttl=_TTL_PROFILE)
+    return result
+```
+
+**关键点**：
+
+1. 缓存 helper 用 try/except `CacheUnavailable`，**永远不让缓存故障级联到上游**。
+2. cache key 用 hash 而不是裸 dict 拼字符串 — 长度可控、稳定（见 §6.17）。
+3. 三档 TTL（短/中/长）按业务"变更频率"分，不要所有缓存一个 TTL。
+4. service 函数本身如果是 sync，加缓存前先评估要不要改成 async — 见 §6.16。
+5. cache miss 路径上不要写「读 cache → 算 → 写 cache」三个 await 全程 try/except，
+只在外层包一次；否则每个 await 失败路径都要重复一遍降级逻辑。
+6. 把 sync 服务函数改 async 会触发测试链上所有调用方改动。改之前先
+`Grep "\b<func_name>\("` 列出所有调用点；改完跑完整测试套件确认无遗漏。
 
 ## 11. 文档维护
 
