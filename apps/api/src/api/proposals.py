@@ -16,6 +16,8 @@ from src.db.candidate import (
     ProposalType,
     ConfidenceLevel,
 )
+from src.db.evidence import Evidence
+from src.db.governance import AuditEvent, AuditEventType
 
 router = APIRouter(prefix="/proposals", tags=["候选提案"])
 
@@ -321,22 +323,108 @@ async def create_decision(
         proposal.status = ProposalStatus.REJECTED
     elif data.decision == "merge":
         proposal.status = ProposalStatus.MERGED
-    
+
     proposal.reviewed_at = proposal.updated_at
-    
-    # 创建决策记录
+
+    # ================================================================
+    # HIA-72 B3: 预先创建 ReviewDecision（用于 evidence 确认的 actor 信息）
+    # 必须在 evidence 确认前 flush，以便引用 decision.created_at / decided_by
+    # ================================================================
     decision = ReviewDecision(
         proposal_id=proposal_id,
         decision=data.decision,
         notes=data.notes,
-        decided_by=uuid.uuid4(),  # TODO: 从认证获取
-        decided_by_name="System User",  # TODO: 从认证获取
+        decided_by=uuid.uuid4(),  # TODO: 从认证上下文获取真实 user_id
+        decided_by_name="System User",  # TODO: 从认证上下文获取
         target_class_id=data.target_class_id,
         target_property_id=data.target_property_id,
         proposal_version=proposal.version,
     )
-    
     session.add(decision)
+    await session.flush()  # 确保 decision.created_at / id 可用
+
+    # ================================================================
+    # HIA-72 B3: 候选接受后写 Evidence 回溯记录
+    # ================================================================
+    if data.decision == "accept" and proposal.source_id:
+        # 从 proposal.content / source_context 中取 profiling 阶段写入的字段上下文
+        content = proposal.content or {}
+        source_context = proposal.source_context or {}
+        field_name = source_context.get("field_name") or content.get("field_name")
+
+        # 目标 IRI：优先用 target_*_id 解析，否则从 content 建议的 IRI 兜底
+        class_iri = content.get("suggested_class_iri")
+        property_iri = content.get("suggested_property_iri")
+
+        # 找关联的 Evidence 记录并更新（HIA-72 B3 evidence_link 回溯）
+        try:
+            source_uuid = uuid.UUID(proposal.source_id)
+        except (ValueError, TypeError):
+            source_uuid = None
+
+        ev_filters = []
+        if source_uuid:
+            ev_filters.append(Evidence.source_id == source_uuid)
+        if field_name:
+            ev_filters.append(Evidence.field_name == field_name)
+
+        ev_query = select(Evidence)
+        if ev_filters:
+            ev_query = ev_query.where(*ev_filters)
+        elif proposal.project_id:
+            ev_query = ev_query.where(Evidence.project_id == proposal.project_id)
+        else:
+            ev_filters = None  # 没有过滤条件，跳过更新
+
+        if ev_filters is not None:
+            ev_result = await session.execute(ev_query)
+            matched_evidences = list(ev_result.scalars().all())
+
+            confirmed_count = 0
+            for ev in matched_evidences:
+                before_state = {
+                    "is_confirmed": ev.is_confirmed,
+                    "ontology_class_iri": ev.ontology_class_iri,
+                    "property_iri": ev.property_iri,
+                }
+                if class_iri:
+                    ev.ontology_class_iri = class_iri
+                if property_iri:
+                    ev.property_iri = property_iri
+                ev.is_confirmed = True
+                ev.confirmed_by = decision.decided_by
+                ev.confirmed_at = decision.created_at
+
+                # 写审计事件（append-only）
+                audit_entry = AuditEvent(
+                    event_type=AuditEventType.UPDATE,
+                    actor_id=decision.decided_by,
+                    actor_name=decision.decided_by_name,
+                    project_id=proposal.project_id,
+                    target_type="evidence",
+                    target_id=str(ev.id),
+                    target_label=field_name,
+                    before=before_state,
+                    after={
+                        "is_confirmed": True,
+                        "ontology_class_iri": class_iri,
+                        "property_iri": property_iri,
+                        "proposal_id": str(proposal_id),
+                    },
+                    notes=f"Proposal {proposal_id} accepted → evidence confirmed",
+                )
+                session.add(audit_entry)
+                confirmed_count += 1
+
+            # 把已确认的 Evidence IDs 写回 proposal.content 供回溯（HIA-72 B3）
+            if confirmed_count > 0:
+                evidence_ids = [str(ev.id) for ev in matched_evidences]
+                proposal.content = {
+                    **content,
+                    "confirmed_evidence_ids": evidence_ids,
+                    "confirmed_at": decision.created_at.isoformat() if decision.created_at else None,
+                }
+
     await session.flush()
     await session.refresh(decision)
     
