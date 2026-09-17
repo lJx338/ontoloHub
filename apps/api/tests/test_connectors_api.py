@@ -291,3 +291,156 @@ async def _get_async_factory():
     import importlib
     conn_mod = importlib.import_module("src.db.connection")
     return conn_mod.async_session_factory
+
+
+# ---------------------------------------------------------------------------
+# HIA-67 B2: Connector Snapshot → Evidence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_snapshot_to_evidence_creates_source_and_evidence(client, project_and_admin, tmp_path):
+    """HIA-67 验收: snapshot-to-evidence 创建 Source + Evidence 记录。"""
+    pid, uid = project_and_admin
+    # 创建 CSV connector（可用作快照测试）
+    p = tmp_path / "ev.csv"
+    with p.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["email", "name", "age"])
+        w.writeheader()
+        for i in range(10):
+            w.writerow({"email": f"u{i}@x.com", "name": f"User{i}", "age": str(20 + i)})
+
+    body = {
+        "type": "csv",
+        "name": "users-ev",
+        "config": {"path": str(p)},
+        "secret_fields": [],
+    }
+    r = await client.post(f"/connectors?project_id={pid}", json=body, headers=hdrs(uid))
+    assert r.status_code == 201, r.text
+    cid = r.json()["id"]
+
+    # 拿表名
+    r = await client.get(f"/connectors/{cid}/tables?project_id={pid}", headers=hdrs(uid))
+    table_name = r.json()[0]["name"]
+
+    # 快照 → evidence
+    r = await client.post(
+        f"/connectors/{cid}/snapshot-to-evidence?project_id={pid}",
+        json={"table": table_name, "limit": 5, "auto_evidence": True},
+        headers=hdrs(uid),
+    )
+    assert r.status_code == 201, r.text
+    data = r.json()
+
+    assert "source_id" in data
+    assert "snapshot_id" in data
+    assert data["table"] == table_name
+    assert data["row_count"] == 5
+    assert len(data["evidence_ids"]) == 3  # email, name, age 三个字段
+
+    # profile 包含 null_ratio / unique_ratio / inferred_type
+    profile = data["profile"]
+    assert "email" in profile
+    assert profile["email"]["inferred_type"] == "string"
+    assert "sample_values" in profile["email"]
+    assert 0.0 <= profile["email"]["null_ratio"] <= 1.0
+
+
+@pytest.mark.asyncio
+async def test_snapshot_to_evidence_auto_evidence_false(client, project_and_admin, tmp_path):
+    """auto_evidence=false 时只创建 Source，不创建 Evidence。"""
+    pid, uid = project_and_admin
+    p = tmp_path / "no-ev.csv"
+    with p.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["x", "y"])
+        w.writeheader()
+        for i in range(5):
+            w.writerow({"x": f"x{i}", "y": str(i)})
+
+    r = await client.post(
+        f"/connectors?project_id={pid}",
+        json={"type": "csv", "name": "no-ev", "config": {"path": str(p)}},
+        headers=hdrs(uid),
+    )
+    cid = r.json()["id"]
+
+    r = await client.get(f"/connectors/{cid}/tables?project_id={pid}", headers=hdrs(uid))
+    table_name = r.json()[0]["name"]
+
+    r = await client.post(
+        f"/connectors/{cid}/snapshot-to-evidence?project_id={pid}",
+        json={"table": table_name, "auto_evidence": False},
+        headers=hdrs(uid),
+    )
+    assert r.status_code == 201, r.text
+    data = r.json()
+    assert data["source_id"]
+    assert data["snapshot_id"]
+    assert len(data["evidence_ids"]) == 0  # 没创建 Evidence
+    assert len(data["profile"]) == 2  # 但字段统计还是有的
+
+
+@pytest.mark.asyncio
+async def test_snapshot_to_evidence_cross_project(client, project_and_admin, isolated_app, tmp_path):
+    """snapshot-to-evidence 跨项目 → 404（隔离验证）。"""
+    pid, uid = project_and_admin
+    p = tmp_path / "cross.csv"
+    with p.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["a"])
+        w.writeheader()
+        w.writerow({"a": "1"})
+
+    r = await client.post(
+        f"/connectors?project_id={pid}",
+        json={"type": "csv", "name": "cross", "config": {"path": str(p)}},
+        headers=hdrs(uid),
+    )
+    cid = r.json()["id"]
+
+    r = await client.get(f"/connectors/{cid}/tables?project_id={pid}", headers=hdrs(uid))
+    table_name = r.json()[0]["name"]
+
+    # 用另一个项目 ID（不存在的）
+    other_pid = uuid.uuid4()
+    r = await client.post(
+        f"/connectors/{cid}/snapshot-to-evidence?project_id={other_pid}",
+        json={"table": table_name},
+        headers=hdrs(uid),
+    )
+    assert r.status_code == 404  # 跨项目隔离 → 404
+
+
+@pytest.mark.asyncio
+async def test_snapshot_to_evidence_field_type_inference(client, project_and_admin, tmp_path):
+    """PG 列类型 → 本体数据类型的映射正确。"""
+    pid, uid = project_and_admin
+    p = tmp_path / "types.csv"
+    with p.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["uid", "is_active", "score", "joined_at"])
+        w.writeheader()
+        w.writerow({"uid": "123", "is_active": "true", "score": "99.5", "joined_at": "2024-01-01"})
+
+    r = await client.post(
+        f"/connectors?project_id={pid}",
+        json={"type": "csv", "name": "types", "config": {"path": str(p)}},
+        headers=hdrs(uid),
+    )
+    cid = r.json()["id"]
+
+    r = await client.get(f"/connectors/{cid}/tables?project_id={pid}", headers=hdrs(uid))
+    table_name = r.json()[0]["name"]
+
+    r = await client.post(
+        f"/connectors/{cid}/snapshot-to-evidence?project_id={pid}",
+        json={"table": table_name, "auto_evidence": True},
+        headers=hdrs(uid),
+    )
+    assert r.status_code == 201, r.text
+    profile = r.json()["profile"]
+
+    # CSV 不做类型推断 → 都是 string（PG connector 会用真实 PG 类型）
+    assert profile["uid"]["inferred_type"] == "string"
+    assert profile["is_active"]["inferred_type"] == "string"
+    assert profile["score"]["inferred_type"] == "string"
+    assert profile["joined_at"]["inferred_type"] == "string"

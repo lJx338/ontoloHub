@@ -627,12 +627,44 @@ replies: Mapped[List["ChangeRequestComment"]] = relationship(
     remote_side=[id],  # 父端
     cascade="all, delete-orphan",
 )
-parent: Mapped["ChangeRequestComment"] = relationship(
+parent: Mapped["ChangeRequestComment"]] = relationship(
     "ChangeRequestComment",
     back_populates="replies",
     remote_side=[ChangeRequestComment.parent_id],
 )
 ```
+
+### 6.27 PG connector 写库必须"白化"连接信息（HIA-67）
+
+**症状**：`snapshot-to-evidence` 端点把 connector 的 `config` dict 直接写到
+`sources.connection_info`，结果：
+1. **密码泄漏到 DB** — 加密只在 `connectors.config` 字段有效；`sources.connection_info`
+   是普通 JSON，没人解密它，等于明文。
+2. **`/projects/{id}/sources` 接口返回带明文密码的对象** — 任何项目成员都看得到。
+3. **源标识错位** — 后端再用 `sources.connection_info` 重连 PG 会拿错凭据。
+
+**原因**：直接复制原始 config 是最省事的实现路径，但忽略了"两边字段的
+加密策略不同"。
+
+**规避**：snapshot-to-evidence 端点**只写白化字段**：
+
+```python
+safe_conn_info = {
+    "type": "postgresql",
+    "host": plain_cfg["host"],
+    "port": plain_cfg.get("port", 5432),
+    "database": plain_cfg["database"],
+    "schema": plain_cfg.get("schema_filter", []),
+    "table_filter": plain_cfg.get("table_filter", []),
+    # 显式不写 password / username
+}
+# 关联回原 connector 用于追溯
+schema_info = {"table": body.table, "connector_id": str(conn.id)}
+```
+
+如果一定要保留完整凭据（不可取），至少用 `src.core.secrets.encrypt_secret_fields`
+先加密再写 `connection_info`；但更干净的做法是**不存**，靠 `connector_id` +
+`connector.secret_fields` 的加密链路管理凭据。
 
 ---
 
@@ -1007,3 +1039,100 @@ PG 上扩展 enum 用 `ALTER TYPE ... ADD VALUE` 但必须在事务外（Alembic
 包事务 → 用 `execution_options(isolation_level="AUTOCOMMIT")` 绕开）。
 SQLite 上 enum 是字符串 + CHECK 约束，扩展 enum 一般不需要碰 schema —
 应用层校验即可。详见 §6.24。
+
+## 14. Connector Snapshot → Evidence（HIA-67 / B2）
+
+### 14.1 两条端点的语义差异
+
+| 端点 | 用途 | 副作用 |
+|---|---|---|
+| `POST /connectors/{id}/snapshot` | 临时拉数据看（探索 / 调试） | 仅审计 READ，**不写库** |
+| `POST /connectors/{id}/snapshot-to-evidence` | 把快照**固化**成 Source + Evidence | 写 Source + SourceSnapshot + N 条 Evidence（每字段一条） |
+
+第二个端点是 HIA-67 验收点，**等价于文件上传的入库流程**：
+走的是同一个 `Source` / `SourceSnapshot` / `Evidence` 表。
+
+### 14.2 Source.connection_info 的"白化"原则
+
+PG connector 的 config 里包含明文密码（解密后传入 connector）。
+`snapshot-to-evidence` **写入数据库时不能复制原始 config**，否则：
+
+1. 密码泄漏到 `sources.connection_info` JSON 字段 → `/projects/{id}/sources`
+   接口可能把它暴露给前端。
+2. 后续重读 source 时会用错凭据。
+
+**做法**：写库时只存"白化连接信息"，如：
+
+```python
+safe_conn_info = {
+    "type": "postgresql",
+    "host": "...",
+    "port": 5432,
+    "database": "...",
+    "schema": [...],          # schema_filter
+    "table_filter": [...],     # table_filter
+    # 显式 password / username 字段不写
+}
+# 然后 schema_info 记录 connector_id 让可追溯回原 connector
+schema_info = {"table": body.table, "connector_id": str(conn.id), "connector_name": ...}
+```
+
+### 14.3 Evidence 字段推断
+
+每个字段一条 `Evidence` 记录，`extraction_params` 存推断信息：
+
+```python
+extraction_params={
+    "connector_id": "...",
+    "pg_data_type": "integer",       # 原始 PG 类型
+    "inferred_type": "int",          # 映射到本体类型
+    "null_ratio": 0.05,
+    "unique_ratio": 0.95,
+    "sample_values": ["x", "y", "z"]
+}
+```
+
+`_PG_TYPE_TO_MODEL` 映射表定义在 `connectors.py` 顶部，覆盖：
+
+| PG | 本体 |
+|---|---|
+| integer / bigint / smallint | `int` |
+| numeric / real / double precision | `float` |
+| boolean | `bool` |
+| character varying / text / character | `string` |
+| date / timestamp[] / time[] | `date` |
+| uuid / json / jsonb | `string` |
+
+**未匹配的类型默认 `string`**（保守），前端可在 UI 里二次确认。
+
+### 14.4 字段统计必须在客户端算
+
+snapshot 接口返回的 `rows` 是 `dict[str, Any]`，不能假定服务端的 connector
+能给你统计。`snapshot-to-evidence` 自己写循环算 `null_ratio` /
+`unique_ratio`，原因：
+
+- 服务端 connector 重复算会让 connector 接口膨胀
+- 字段统计只对"快照这一批"有意义，没必要让 connector 实现者关心
+- 一致性：所有 connector（csv / json / postgresql）走同一份统计代码
+
+### 14.5 避坑
+
+- **权限提升**：snapshot-to-evidence 需要 EDITOR（不是 VIEWER）。它写本体候选，
+  不仅是读。**不要图省事用 VIEWER** —— 让 audit log 一查就发现越权。
+- **路径隔离**：URL 是 `/connectors/{id}/snapshot-to-evidence?project_id=...`，
+  必须用 `require_role_query(Role.EDITOR)`，**不要**用 `require_role`（path 版）。
+- **审计**：写 `CREATE` 类型 audit event，`after` 字段含 source_id /
+  snapshot_id / evidence_count，方便回溯。
+- **PG connector 自带白名单**：`_passes_filter` 校验 schema/table 在白名单
+  才让 snapshot。若用户调一张不在白名单的表，**前端会拿 400** 而非 500；
+  错误信息直接显示 `ConnectorError` 消息即可。
+
+### 14.6 测试覆盖清单
+
+新加 connector → evidence 端点，**至少**覆盖：
+
+1. **happy path**：snapshot + auto_evidence=true → evidence_count == column_count
+2. **auto_evidence=false**：只创建 Source，不创建 Evidence
+3. **跨项目 → 404**：用其他 project_id 访问 → 404
+4. **类型映射**：PG 类型 → 本体类型映射正确（集成到所有 snapshot-to-evidence 测试）
+5. **统计正确性**：null_ratio / unique_ratio / sample_values 在多行场景下准确

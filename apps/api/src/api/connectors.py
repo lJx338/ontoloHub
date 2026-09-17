@@ -37,6 +37,7 @@ from src.core.secrets import (
 )
 from src.db.connection import get_session
 from src.db.connector import Connector, ConnectorStatus, ConnectorType
+from src.db.evidence import Evidence, EvidenceType, Source, SourceSnapshot, SourceStatus, SourceType
 from src.db.governance import AuditEventType
 from src.db.identity import Role
 from src.services.connectors import (
@@ -138,9 +139,62 @@ class ConnectorSnapshotResponse(BaseModel):
     rows: list[dict[str, Any]]
 
 
+class ConnectorSnapshotToEvidenceRequest(BaseModel):
+    """快照参数 + 是否自动为每个字段生成 evidence（HIA-67 B2 验收用）。"""
+
+    table: str = Field(..., min_length=1, max_length=255)
+    limit: int = Field(default=1000, ge=1, le=100_000)
+    offset: int = Field(default=0, ge=0)
+    auto_evidence: bool = Field(
+        default=True,
+        description="true 时为每个字段自动生成 Evidence 记录（默认开启）",
+    )
+
+
+class ConnectorSnapshotToEvidenceResponse(BaseModel):
+    """快照结果 + 创建的 Source / Evidence 记录 ID（HIA-67 验收用）。"""
+
+    source_id: uuid.UUID
+    snapshot_id: uuid.UUID
+    table: str
+    fields: list[dict[str, Any]]
+    row_count: int
+    truncated: bool
+    rows: list[dict[str, Any]]
+    evidence_ids: list[uuid.UUID]
+    profile: dict[str, Any]  # 字段统计（null_ratio / unique_ratio / sample_values）
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# PG 列类型到 ontology 数据类型的映射（HIA-67 字段推断）
+_PG_TYPE_TO_MODEL: dict[str, str] = {
+    "integer": "int",
+    "bigint": "int",
+    "smallint": "int",
+    "numeric": "float",
+    "real": "float",
+    "double precision": "float",
+    "boolean": "bool",
+    "character varying": "string",
+    "character": "string",
+    "text": "string",
+    "date": "date",
+    "timestamp without time zone": "date",
+    "timestamp with time zone": "date",
+    "time without time zone": "date",
+    "time with time zone": "date",
+    "uuid": "string",
+    "json": "string",
+    "jsonb": "string",
+}
+
+
+def _pg_type_to_model(pg_type: str) -> str:
+    """把 PostgreSQL 列类型映射到本体数据类型。"""
+    return _PG_TYPE_TO_MODEL.get(pg_type.lower(), "string")
 
 
 async def _load_for_project(
@@ -577,4 +631,199 @@ async def snapshot_connector(
         row_count=snap.row_count,
         truncated=snap.truncated,
         rows=snap.rows,
+    )
+
+
+# ---------------------------------------------------------------------------
+# HIA-67 B2: Connector Snapshot → Evidence（HIA-67 验收用）
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/{connector_id}/snapshot-to-evidence",
+    response_model=ConnectorSnapshotToEvidenceResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def snapshot_to_evidence(
+    connector_id: uuid.UUID,
+    body: ConnectorSnapshotToEvidenceRequest,
+    project_id: uuid.UUID = Query(..., description="项目 ID"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role_query(Role.EDITOR)),
+    session: AsyncSession = Depends(get_session),
+    request: Request = None,
+) -> ConnectorSnapshotToEvidenceResponse:
+    """快照 PG 表并自动创建 Source + Evidence 记录（HIA-67 验收端点）。
+
+    流程：
+    1. 用 connector 配置运行 snapshot（只读）
+    2. 创建 Source 记录（type=POSTGRESQL，存储连接器元信息）
+    3. 创建 SourceSnapshot（版本化快照元数据）
+    4. 为每个字段创建 Evidence 记录（含 null_ratio / unique_ratio 等统计）
+
+    权限：EDITOR 及以上（因为写入本体候选数据）。
+    """
+    principal, _ = ctx
+    conn_record = await _load_for_project(
+        session, connector_id=connector_id, project_id=project_id
+    )
+    plain_cfg = decrypt_secret_fields(
+        conn_record.config or {}, conn_record.secret_fields or []
+    )
+    try:
+        c = get_connector(conn_record.type.value, plain_cfg)
+        snap = await asyncio.wait_for(
+            c.snapshot(body.table, limit=body.limit, offset=body.offset),
+            timeout=60,
+        )
+    except ConnectorError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="snapshot timed out")
+
+    # 构建 connection_info（不存明文密码）
+    safe_conn_info = {
+        "type": conn_record.type.value,
+        "host": plain_cfg.get("host", ""),
+        "port": plain_cfg.get("port", 5432),
+        "database": plain_cfg.get("database", ""),
+        "schema": plain_cfg.get("schema_filter", []),
+        "table_filter": plain_cfg.get("table_filter", []),
+    }
+
+    # 计算字段统计（用于 Evidence profile）
+    field_profiles: dict[str, dict[str, Any]] = {}
+    for f in snap.fields:
+        null_count = sum(1 for row in snap.rows if row.get(f.name) is None)
+        null_ratio = null_count / snap.row_count if snap.row_count > 0 else 0.0
+        unique_vals = set(row.get(f.name) for row in snap.rows if row.get(f.name) is not None)
+        unique_ratio = len(unique_vals) / snap.row_count if snap.row_count > 0 else 0.0
+        sample_vals = list(unique_vals)[:5]
+        field_profiles[f.name] = {
+            "null_ratio": round(null_ratio, 4),
+            "unique_ratio": round(unique_ratio, 4),
+            "sample_values": [str(v) for v in sample_vals],
+            "inferred_type": _pg_type_to_model(f.data_type),
+        }
+
+    # 1. 创建 Source
+    source = Source(
+        project_id=project_id,
+        name=f"[{conn_record.name}] {body.table}",
+        description=f"PostgreSQL connector snapshot: {body.table}",
+        source_type=SourceType.POSTGRESQL,
+        connection_info=safe_conn_info,
+        file_path=None,
+        file_size=None,
+        row_count=snap.row_count,
+        column_count=len(snap.fields),
+        access_scope="restricted",
+        is_sensitive=False,
+        schema_info={
+            "table": body.table,
+            "connector_id": str(conn_record.id),
+            "connector_name": conn_record.name,
+        },
+        status=SourceStatus.READY,
+        created_by=principal.user.id,
+    )
+    session.add(source)
+    await session.flush()
+    await session.refresh(source)
+
+    # 2. 创建 SourceSnapshot
+    import hashlib
+
+    schema_str = ",".join(f"{f.name}:{f.data_type}" for f in snap.fields)
+    schema_hash = hashlib.sha256(schema_str.encode()).hexdigest()
+    snapshot_record = SourceSnapshot(
+        source_id=source.id,
+        version=1,
+        snapshot_type="connector_snapshot",
+        storage_path=None,
+        storage_size=None,
+        checksum=None,
+        row_count=snap.row_count,
+        schema_hash=schema_hash,
+        created_by=principal.user.id,
+    )
+    session.add(snapshot_record)
+    await session.flush()
+    await session.refresh(snapshot_record)
+
+    # 3. 为每个字段创建 Evidence
+    evidence_ids: list[uuid.UUID] = []
+    if body.auto_evidence:
+        for f in snap.fields:
+            profile = field_profiles.get(f.name, {})
+            ev = Evidence(
+                project_id=project_id,
+                source_id=source.id,
+                evidence_type=EvidenceType.SOURCE_FIELD,
+                location=f"column:{body.table}.{f.name}",
+                field_name=f.name,
+                content=", ".join(profile.get("sample_values", [])[:5]) or None,
+                source_identifier=body.table,
+                extraction_method="connector_snapshot",
+                extraction_params={
+                    "connector_id": str(conn_record.id),
+                    "connector_name": conn_record.name,
+                    "pg_data_type": f.data_type,
+                    "inferred_type": profile.get("inferred_type", "string"),
+                    "null_ratio": profile.get("null_ratio", 0),
+                    "unique_ratio": profile.get("unique_ratio", 0),
+                    "sample_values": profile.get("sample_values", []),
+                },
+                strength="medium",
+                created_by=principal.user.id,
+            )
+            session.add(ev)
+        await session.flush()
+
+        result = await session.execute(
+            select(Evidence).where(
+                Evidence.source_id == source.id,
+                Evidence.project_id == project_id,
+            )
+        )
+        evidence_ids = [e.id for e in result.scalars().all()]
+
+    # 审计
+    await record_audit(
+        session,
+        event_type=AuditEventType.CREATE,
+        principal=principal,
+        project_id=project_id,
+        request=request,
+        target_type="connector_snapshot_to_evidence",
+        target_id=str(source.id),
+        target_label=f"{conn_record.name}/{body.table}",
+        after={
+            "connector_id": str(conn_record.id),
+            "table": body.table,
+            "row_count": snap.row_count,
+            "field_count": len(snap.fields),
+            "source_id": str(source.id),
+            "snapshot_id": str(snapshot_record.id),
+            "evidence_count": len(evidence_ids),
+        },
+    )
+
+    return ConnectorSnapshotToEvidenceResponse(
+        source_id=source.id,
+        snapshot_id=snapshot_record.id,
+        table=snap.table,
+        fields=[
+            {
+                "name": f.name,
+                "data_type": f.data_type,
+                "nullable": f.nullable,
+                "profile": field_profiles.get(f.name, {}),
+            }
+            for f in snap.fields
+        ],
+        row_count=snap.row_count,
+        truncated=snap.truncated,
+        rows=snap.rows,
+        evidence_ids=evidence_ids,
+        profile=field_profiles,
     )
