@@ -21,6 +21,7 @@ from src.services.candidates import (
     _group_fields_by_value_overlap,
     # 已有 helpers（也顺便覆盖）
     _normalize_field_name,
+    _normalize_key,
     _classify_field_type,
     _compute_confidence,
     _FIELD_VALUE_OVERLAP_THRESHOLD,
@@ -510,3 +511,91 @@ class TestCrossFieldScenario:
 def test_overlap_threshold_sensible():
     """业务约定：跨字段分组阈值是 0.7（不是太严也不是太松）。"""
     assert 0.5 < _FIELD_VALUE_OVERLAP_THRESHOLD < 0.9
+
+
+# ============================================================================
+# 字段名同义词表（HIA-72 B3）
+# ============================================================================
+
+
+class TestNormalizeKey:
+    """_normalize_key: 驼峰/连字符/中文统一归一化。"""
+
+    def test_camel_case(self):
+        from src.services.candidates import _normalize_key
+        assert _normalize_key("userEmail") == "user_email"
+        assert _normalize_key("UserEmail") == "user_email"
+
+    def test_kebab_case(self):
+        from src.services.candidates import _normalize_key
+        assert _normalize_key("user-email") == "user_email"
+        assert _normalize_key("E-Mail") == "e_mail"
+
+    def test_mixed(self):
+        from src.services.candidates import _normalize_key
+        assert _normalize_key("user_Email-Address") == "user_email_address"
+
+    def test_strip_whitespace(self):
+        from src.services.candidates import _normalize_key
+        assert _normalize_key("  userEmail  ") == "user_email"
+
+    def test_chinese(self):
+        from src.services.candidates import _normalize_key
+        assert _normalize_key("邮箱") == "邮箱"
+
+
+class TestGeneratePropertyNameSynonyms:
+    """_generate_property_name: 同义词表优先（HIA-72 B3）。"""
+
+    def test_email_variants_all_map_to_email_address(self):
+        from src.services.candidates import _generate_property_name
+        for variant in ["email", "e-mail", "e_mail", "mail", "邮箱", "电子邮件"]:
+            assert _generate_property_name(variant, "string") == "email_address", \
+                f"{variant} should map to email_address"
+
+    def test_phone_variants(self):
+        from src.services.candidates import _generate_property_name
+        for variant in ["phone", "telephone", "tel", "mobile", "phone_number", "手机"]:
+            assert _generate_property_name(variant, "string") == "phone_number", \
+                f"{variant} should map to phone_number"
+
+    def test_name_variants(self):
+        from src.services.candidates import _generate_property_name
+        for variant in ["name", "full_name", "user_name", "username", "customer_name"]:
+            assert _generate_property_name(variant, "string") == "full_name"
+
+    def test_camel_case_lookup(self):
+        from src.services.candidates import _generate_property_name
+        # camelCase 归一化后查同义词表
+        assert _generate_property_name("createdAt", "datetime") == "created_at"
+        assert _generate_property_name("userId", "string") == "user_id"
+
+    def test_kebab_case_lookup(self):
+        from src.services.candidates import _generate_property_name
+        assert _generate_property_name("created-at", "datetime") == "created_at"
+        assert _generate_property_name("order-no", "string") == "order_number"
+
+    def test_fallback_when_no_synonym(self):
+        from src.services.candidates import _generate_property_name
+        # 兜底：不在同义词表里的字段名走分词逻辑
+        result = _generate_property_name("xyz_custom_field", "string")
+        assert len(result) > 0
+
+    def test_status_boolean_mapping(self):
+        from src.services.candidates import _generate_property_name
+        assert _generate_property_name("is_active", "boolean") == "is_active"
+        assert _generate_property_name("is_deleted", "boolean") == "is_deleted"
+
+    def test_chinese_field_names(self):
+        from src.services.candidates import _generate_property_name
+        assert _generate_property_name("姓名", "string") == "full_name"
+        assert _normalize_key("姓名") == "姓名"  # 中文不过 normalize
+
+    def test_no_collisions_between_variants(self):
+        """email 变体映射到 email_address；phone 变体映射到 phone_number；不串台。"""
+        from src.services.candidates import _generate_property_name
+        email_result = _generate_property_name("e_mail", "string")
+        phone_result = _generate_property_name("telephone", "string")
+        assert email_result == "email_address"
+        assert phone_result == "phone_number"
+        assert email_result != phone_result

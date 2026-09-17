@@ -155,6 +155,148 @@ FIELD_TYPE_HINTS: dict[str, str] = {
     "enabled": "boolean",
 }
 
+# HIA-72 B3: 字段名同义词 → 规范化本体属性名 + 数据类型
+# 支持多语言、多格式变体；按归一化 key（小写/下划线/驼峰统一）查找。
+# 使用 tuple[canonical_property_name, data_type]，data_type 用于类型推断。
+_FIELD_NAME_SYNONYMS: dict[str, tuple[str, str]] = {
+    # ---- email ----
+    "email": ("email_address", "string"),
+    "e_mail": ("email_address", "string"),
+    "e-mail": ("email_address", "string"),
+    "mail": ("email_address", "string"),
+    "邮箱": ("email_address", "string"),
+    "电子邮件": ("email_address", "string"),
+    "contact_email": ("email_address", "string"),
+    # ---- phone ----
+    "phone": ("phone_number", "string"),
+    "telephone": ("phone_number", "string"),
+    "tel": ("phone_number", "string"),
+    "mobile": ("phone_number", "string"),
+    "mobile_phone": ("phone_number", "string"),
+    "phone_number": ("phone_number", "string"),
+    "电话": ("phone_number", "string"),
+    "手机": ("phone_number", "string"),
+    # ---- name ----
+    "name": ("full_name", "string"),
+    "full_name": ("full_name", "string"),
+    "user_name": ("full_name", "string"),
+    "username": ("full_name", "string"),
+    "customer_name": ("full_name", "string"),
+    "contact_name": ("full_name", "string"),
+    "姓名": ("full_name", "string"),
+    "nickname": ("nickname", "string"),
+    "nick": ("nickname", "string"),
+    "alias": ("alias", "string"),
+    # ---- address ----
+    "address": ("address", "string"),
+    "addr": ("address", "string"),
+    "street": ("street_address", "string"),
+    "city": ("city", "string"),
+    "province": ("province", "string"),
+    "state": ("state", "string"),
+    "country": ("country", "string"),
+    "zip": ("postal_code", "string"),
+    "zipcode": ("postal_code", "string"),
+    "postal_code": ("postal_code", "string"),
+    "邮编": ("postal_code", "string"),
+    "城市": ("city", "string"),
+    "国家": ("country", "string"),
+    # ---- datetime ----
+    "created_at": ("created_at", "datetime"),
+    "created_date": ("created_at", "datetime"),
+    "created_time": ("created_at", "datetime"),
+    "created_on": ("created_at", "datetime"),
+    "updated_at": ("updated_at", "datetime"),
+    "updated_date": ("updated_at", "datetime"),
+    "updated_time": ("updated_at", "datetime"),
+    "deleted_at": ("deleted_at", "datetime"),
+    "birthdate": ("birth_date", "date"),
+    "birth_day": ("birth_date", "date"),
+    "出生日期": ("birth_date", "date"),
+    "创建时间": ("created_at", "datetime"),
+    "更新时间": ("updated_at", "datetime"),
+    "注册时间": ("registered_at", "datetime"),
+    "注册日期": ("registered_at", "datetime"),
+    # ---- identifier ----
+    "id": ("identifier", "identifier"),
+    "uuid": ("identifier", "identifier"),
+    "guid": ("identifier", "identifier"),
+    "code": ("identifier", "identifier"),
+    "no": ("identifier", "identifier"),
+    "number": ("identifier", "identifier"),
+    "sn": ("serial_number", "identifier"),
+    "serial": ("serial_number", "identifier"),
+    "serial_number": ("serial_number", "identifier"),
+    "order_no": ("order_number", "identifier"),
+    "order_number": ("order_number", "identifier"),
+    "订单号": ("order_number", "identifier"),
+    "product_code": ("product_code", "identifier"),
+    "product_id": ("product_id", "identifier"),
+    "user_id": ("user_id", "identifier"),
+    "customer_id": ("customer_id", "identifier"),
+    "编号": ("identifier", "identifier"),
+    # ---- quantity / amount ----
+    "price": ("price", "quantity"),
+    "unit_price": ("unit_price", "quantity"),
+    "total_price": ("total_price", "quantity"),
+    "amount": ("amount", "quantity"),
+    "total": ("total_amount", "quantity"),
+    "total_amount": ("total_amount", "quantity"),
+    "quantity": ("quantity", "quantity"),
+    "qty": ("quantity", "quantity"),
+    "count": ("count", "quantity"),
+    "num": ("count", "quantity"),
+    "金额": ("amount", "quantity"),
+    "数量": ("quantity", "quantity"),
+    "单价": ("unit_price", "quantity"),
+    # ---- status ----
+    "status": ("status", "category"),
+    "state": ("status", "category"),
+    "is_active": ("is_active", "boolean"),
+    "active": ("is_active", "boolean"),
+    "enabled": ("is_enabled", "boolean"),
+    "is_enabled": ("is_enabled", "boolean"),
+    "deleted": ("is_deleted", "boolean"),
+    "is_deleted": ("is_deleted", "boolean"),
+    "is_valid": ("is_valid", "boolean"),
+    "状态": ("status", "category"),
+    "启用": ("is_enabled", "boolean"),
+    "激活": ("is_active", "boolean"),
+    # ---- description ----
+    "description": ("description", "string"),
+    "desc": ("description", "string"),
+    "remark": ("remark", "string"),
+    "note": ("note", "string"),
+    "memo": ("memo", "string"),
+    "备注": ("remark", "string"),
+    "描述": ("description", "string"),
+    "说明": ("description", "string"),
+    # ---- category ----
+    "type": ("category", "category"),
+    "category": ("category", "category"),
+    "category_name": ("category", "category"),
+    "kind": ("kind", "category"),
+    "level": ("level", "category"),
+    "priority": ("priority", "category"),
+    "级别": ("level", "category"),
+    "优先级": ("priority", "category"),
+    "类型": ("category", "category"),
+}
+
+
+def _normalize_key(name: str) -> str:
+    """字段名归一化：下划线/连字符/驼峰 → 统一下划线小写形式。
+
+    用于在 _FIELD_NAME_SYNONYMS 中查找同义词。
+    例: "userEmail" → "user_email", "E-Mail" → "e_mail"
+    """
+    # 驼峰先拆分（必须在 lower 之前，否则没有大写可识别）
+    s = re.sub(r"([a-z])([A-Z])", r"\1_\2", name.strip())
+    # 统一下划线分隔
+    s = re.sub(r"[_\-]+", "_", s)
+    # 最后小写化
+    return s.lower().strip("_")
+
 # 常见度量单位（用于识别 quantity 类型）
 UNIT_PATTERNS: dict[str, str] = {
     "price": "元",
@@ -417,7 +559,23 @@ def _generate_class_name(field_name: str, field_type: str) -> str:
 
 
 def _generate_property_name(field_name: str, field_type: str) -> str:
-    """从字段名生成候选属性名"""
+    """从字段名生成候选属性名（HIA-72 B3: 同义词表优先）。
+
+    查找顺序：
+    1. _FIELD_NAME_SYNONYMS 精确匹配 → 直接返回规范化属性名
+    2. 归一化 key 匹配 → 直接返回规范化属性名
+    3. 兜底：分词 + 替换表
+    """
+    # 精确匹配（大小写敏感）
+    if field_name in _FIELD_NAME_SYNONYMS:
+        return _FIELD_NAME_SYNONYMS[field_name][0]
+
+    # 归一化 key 匹配（处理驼峰/连字符/中文）
+    normalized = _normalize_key(field_name)
+    if normalized in _FIELD_NAME_SYNONYMS:
+        return _FIELD_NAME_SYNONYMS[normalized][0]
+
+    # 兜底：分词 + 替换表
     words = _split_camel(_normalize_field_name(field_name))
     replacements = {
         "id": "标识", "no": "编号", "name": "名称",
