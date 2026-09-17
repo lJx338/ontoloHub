@@ -184,11 +184,191 @@ def _split_camel(s: str) -> list[str]:
     return [w.lower() for w in words if w]
 
 
+# =====================================================================
+# 字段值相似度（HIA-72 B2）
+# =====================================================================
+
+
+def _normalize_value(v) -> Optional[str]:
+    """归一化字段值用于相似度计算。
+
+    - None / 空字符串 → None
+    - 数字 → 字符串
+    - 大小写无关：lowercase + strip
+    - 类型不同（如 int 1 vs str "1"）统一成相同字符串
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float, bool)):
+        s = str(v)
+    else:
+        s = str(v).strip()
+    if not s or s.lower() in ("none", "null", "nan"):
+        return None
+    return s.lower()
+
+
+def _jaccard_similarity(a: set, b: set) -> float:
+    """Jaccard 相似度：|A ∩ B| / |A ∪ B|。
+
+    空集返回 0.0（避免除零）。对称：A vs B == B vs A。
+    """
+    if not a and not b:
+        return 0.0
+    intersection = len(a & b)
+    union = len(a | b)
+    if union == 0:
+        return 0.0
+    return intersection / union
+
+
+def _levenshtein_distance(s1: str, s2: str) -> int:
+    """编辑距离（Levenshtein distance）。
+
+    O(len(s1)*len(s2)) 时间 + 空间。短字符串够用，长字符串应换 ratio 比较。
+    """
+    if s1 == s2:
+        return 0
+    if not s1:
+        return len(s2)
+    if not s2:
+        return len(s1)
+    # 用滚动数组把空间从 O(n*m) 压到 O(min(n,m))
+    if len(s1) < len(s2):
+        s1, s2 = s2, s1
+    prev_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        cur_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            ins = prev_row[j + 1] + 1
+            dele = cur_row[j] + 1
+            sub = prev_row[j] + (0 if c1 == c2 else 1)
+            cur_row.append(min(ins, dele, sub))
+        prev_row = cur_row
+    return prev_row[-1]
+
+
+def _levenshtein_ratio(s1: str, s2: str) -> float:
+    """归一化的 Levenshtein 相似度：1 - distance / max(len(s1), len(s2))。
+
+    范围 [0.0, 1.0]，越大越相似。
+    """
+    if s1 == s2:
+        return 1.0
+    if not s1 or not s2:
+        return 0.0
+    dist = _levenshtein_distance(s1, s2)
+    return 1.0 - dist / max(len(s1), len(s2))
+
+
+def _field_value_overlap_ratio(field_a: dict, field_b: dict) -> float:
+    """两个字段 sample_values 集合的 Jaccard 重合度。
+
+    取 sample_values（field dict 里的列表）归一化后算 Jaccard。
+    用于跨表跨字段检测"同一语义"（同字段值集合 → 大概率同一概念）。
+    """
+    vals_a = {_normalize_value(v) for v in (field_a.get("sample_values") or [])}
+    vals_b = {_normalize_value(v) for v in (field_b.get("sample_values") or [])}
+    vals_a.discard(None)
+    vals_b.discard(None)
+    return _jaccard_similarity(vals_a, vals_b)
+
+
+def _is_likely_primary_key(field: dict) -> bool:
+    """基于字段统计判断是否像 primary key。
+
+    判定条件（任一满足即可）：
+    - 字段名是 id/code/no/number/_id/_code/_no 之类（不依赖值）
+    - unique_ratio > 0.95 且字符串/整数类型 且 null_ratio < 0.1
+      （"几乎每行都不同" + "基本不空" → PK 候选）
+    - unique_ratio > 0.9 且 null_ratio < 0.05
+    """
+    unique_ratio = field.get("unique_ratio", 0.0) or 0.0
+    null_ratio = field.get("null_ratio", 0.0) or 0.0
+    data_type = (field.get("data_type") or "").lower()
+    name = (field.get("name") or "").lower().strip()
+
+    # 字段名规则
+    pk_name_patterns = ("_id", "id$", "^id$", "^no$", "_no$", "_code$", "^code$",
+                       "_key$", "^key$", "_uuid$", "^uuid$")
+    for pat in pk_name_patterns:
+        if re.search(pat, name):
+            return True
+
+    # 统计规则（要求 null 率低 — unique_ratio 高但 null 也多的字段不算 PK）
+    if unique_ratio > 0.95 and data_type in ("string", "integer") and null_ratio < 0.1:
+        return True
+    if unique_ratio > 0.9 and null_ratio < 0.05:
+        return True
+    return False
+
+
+# 跨字段相似度阈值：超过则视为"同一语义字段"
+_FIELD_VALUE_OVERLAP_THRESHOLD = 0.7
+
+
+def _group_fields_by_value_overlap(
+    fields: list[dict],
+    threshold: float = _FIELD_VALUE_OVERLAP_THRESHOLD,
+) -> list[list[str]]:
+    """把 sample_values 集合高重合的字段名分组到一起。
+
+    返回字段名 list 的列表，每个子列表代表"同一语义字段组"。
+    简单 union-find：两两算 Jaccard，超过 threshold 视为同一组。
+    O(n^2) 比较，n 是字段数（一般 ≤ 50），可接受。
+    """
+    if not fields:
+        return []
+
+    n = len(fields)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]  # 路径压缩
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    # 预计算每个字段的归一化值集合
+    norm_vals: list[set] = []
+    for f in fields:
+        vals = {_normalize_value(v) for v in (f.get("sample_values") or [])}
+        vals.discard(None)
+        norm_vals.append(vals)
+
+    for i in range(n):
+        if not norm_vals[i]:
+            continue
+        for j in range(i + 1, n):
+            if not norm_vals[j]:
+                continue
+            sim = _jaccard_similarity(norm_vals[i], norm_vals[j])
+            if sim >= threshold:
+                union(i, j)
+
+    # 收集分组
+    groups: dict[int, list[str]] = {}
+    for idx, f in enumerate(fields):
+        root = find(idx)
+        groups.setdefault(root, []).append(f.get("name") or f"field_{idx}")
+    return list(groups.values())
+
+
 def _classify_field_type(field_info: dict) -> str:
     """从剖析结果推断语义类型"""
     data_type = (field_info.get("data_type") or "string").lower()
     enum_vals = field_info.get("detected_enum_values") or []
     unique_ratio = field_info.get("unique_ratio", 1.0)
+
+    # HIA-72 B2: 高唯一字符串字段 → primary key candidate
+    # 在其他类型判定之前优先识别（避免被当 text/label）
+    if _is_likely_primary_key(field_info):
+        return "primary_key"
 
     if enum_vals:
         if len(enum_vals) <= 10:
@@ -256,8 +436,12 @@ def _compute_confidence(field_info: dict, field_type: str) -> tuple[float, Confi
     """计算提案置信度"""
     base = 0.5
 
+    # HIA-72 B2: PK 候选命中 → 基础置信度直接拉高（PK 是高价值信号）
+    if field_type == "primary_key":
+        base = 0.85
+
     # 有枚举值 + 少量枚举 → 高置信度
-    if field_type == "enumeration":
+    elif field_type == "enumeration":
         enum_vals = field_info.get("detected_enum_values") or []
         if len(enum_vals) <= 5:
             base = 0.85
@@ -280,9 +464,16 @@ def _compute_confidence(field_info: dict, field_type: str) -> tuple[float, Confi
     if field_info.get("sample_values"):
         base = min(base + 0.05, 0.95)
 
-    # 唯一性过高（几乎唯一）→ 降分
-    if field_info.get("unique_ratio", 0) > 0.95:
+    # 唯一性过高（几乎唯一）→ 降分（PK 已经特判，不再降）
+    if field_type != "primary_key" and field_info.get("unique_ratio", 0) > 0.95:
         base = max(base - 0.1, 0.4)
+
+    # HIA-72 B2: 高 Jaccard 重合度（与其他字段）→ 同语义 → 加分
+    overlap_max = field_info.get("_max_value_overlap")
+    if overlap_max is not None and overlap_max >= 0.7:
+        # 重合度 0.7+ → 同语义加分（封顶 0.1）
+        bonus = min((overlap_max - 0.7) * 0.33, 0.1)
+        base = min(base + bonus, 0.95)
 
     # 映射到置信度等级
     if base >= 0.8:
@@ -317,10 +508,16 @@ class CandidateGenerationResult:
         proposals_created: int,
         proposals_skipped: int,
         field_profiles: list[dict],
+        value_overlap_groups: Optional[list[list[str]]] = None,
+        primary_key_candidates: Optional[list[str]] = None,
     ):
         self.proposals_created = proposals_created
         self.proposals_skipped = proposals_skipped
         self.field_profiles = field_profiles
+        # HIA-72 B2: 跨表跨字段"同语义"分组（如 {users.email, customers.email}）
+        self.value_overlap_groups = value_overlap_groups or []
+        # HIA-72 B2: 推断出的 primary key 候选字段名列表
+        self.primary_key_candidates = primary_key_candidates or []
 
 
 async def generate_candidates_from_profiling(
@@ -358,29 +555,56 @@ async def generate_candidates_from_profiling(
     # 2. 读取已有对齐（避免重复提案）— 优先从 Redis 缓存读
     aligned_iris = await _get_aligned_iris_set_cached(session, source_id)
 
+    # HIA-72 B2: 跨字段值相似度分组 + 每个字段的最高重合度
+    overlap_groups = _group_fields_by_value_overlap(fields)
+    # 仅保留 >1 个字段的分组（单字段不算"组"）
+    overlap_groups = [g for g in overlap_groups if len(g) > 1]
+    # 字段名 → 与其它字段的最高 Jaccard 重合度
+    field_to_max_overlap: dict[str, float] = {}
+    for group in overlap_groups:
+        # 组内两两算 Jaccard，取最大值
+        for i, name_i in enumerate(group):
+            for j in range(i + 1, len(group)):
+                fi = next((f for f in fields if f.get("name") == name_i), None)
+                fj = next((f for f in fields if f.get("name") == name_j), None)
+                if fi is None or fj is None:
+                    continue
+                sim = _field_value_overlap_ratio(fi, fj)
+                if name_i not in field_to_max_overlap or sim > field_to_max_overlap[name_i]:
+                    field_to_max_overlap[name_i] = sim
+                if name_j not in field_to_max_overlap or sim > field_to_max_overlap[name_j]:
+                    field_to_max_overlap[name_j] = sim
+
+    # HIA-72 B2: 推断 primary key 候选
+    pk_candidates = [f.get("name") for f in fields if _is_likely_primary_key(f) and f.get("name")]
+
     created = 0
     skipped = 0
     profiles: list[dict] = []
 
     for field in fields[:batch_size]:
         f_name = field.get("name", "")
+        # 把 max_overlap 临时塞进 field，让 _compute_confidence 看见（HIA-72 B2）
+        field_with_overlap = dict(field)
+        if f_name in field_to_max_overlap:
+            field_with_overlap["_max_value_overlap"] = field_to_max_overlap[f_name]
 
         # 3. 尝试从 Redis 缓存读取 field profile（HIA-72）
-        cached_profile = await _get_field_profile_cached(field)
+        cached_profile = await _get_field_profile_cached(field_with_overlap)
         if cached_profile is not None:
             f_type = cached_profile["inferred_type"]
             confidence_score = cached_profile["confidence"]
             confidence_level = ConfidenceLevel(cached_profile["confidence_level"])
         else:
-            f_type = _classify_field_type(field)
-            confidence_score, confidence_level = _compute_confidence(field, f_type)
+            f_type = _classify_field_type(field_with_overlap)
+            confidence_score, confidence_level = _compute_confidence(field_with_overlap, f_type)
             profile_dict = {
                 "field_name": f_name,
                 "inferred_type": f_type,
                 "confidence": confidence_score,
                 "confidence_level": confidence_level.value,
             }
-            await _cache_field_profile(field, profile_dict)
+            await _cache_field_profile(field_with_overlap, profile_dict)
 
         profile = {
             "field_name": f_name,
@@ -395,6 +619,11 @@ async def generate_candidates_from_profiling(
             # 标识符/长文本不单独生成属性提案
             skipped += 1
             continue
+        # HIA-72 B2: primary key 候选也跳过普通属性提案 — 它需要单独走"PK 映射"流程
+        # （PK 通常映射成对象的 identifier 而不是某个普通 property）
+        if f_type == "primary_key":
+            skipped += 1
+            continue
 
         # 生成属性提案
         prop_name = _generate_property_name(f_name, f_type)
@@ -403,6 +632,11 @@ async def generate_candidates_from_profiling(
         # 类名（用于描述此字段所属的上下文）
         class_name = _generate_class_name(f_name, f_type)
         class_iri = f"{namespace_base}{class_name.replace(' ', '')}"
+
+        # HIA-72 B2: 把跨证据分组信息塞进 content，方便前端展示同语义字段
+        content_overlap_group = next(
+            (g for g in overlap_groups if f_name in g), None
+        )
 
         proposal = Proposal(
             project_id=source.project_id,
@@ -430,6 +664,9 @@ async def generate_candidates_from_profiling(
                 "unique_ratio": field.get("unique_ratio", 1),
                 "unit": field.get("unit"),
                 "profiling_source_id": str(source_id),
+                # HIA-72 B2: 跨证据同语义字段组（可回溯）
+                "value_overlap_group": content_overlap_group,
+                "is_primary_key_candidate": f_name in pk_candidates,
             },
             source="profiling",
             source_id=str(source_id),
@@ -440,6 +677,8 @@ async def generate_candidates_from_profiling(
                 f"字段「{f_name}」类型为 {f_type}，"
                 f"置信度 {confidence_score:.0%}。"
                 f"建议映射为本体属性：{prop_iri}"
+                + (f"；与同语义字段 {content_overlap_group} 共享值集合。"
+                   if content_overlap_group else "")
             ),
         )
         session.add(proposal)
@@ -450,6 +689,8 @@ async def generate_candidates_from_profiling(
         proposals_created=created,
         proposals_skipped=skipped,
         field_profiles=profiles,
+        value_overlap_groups=overlap_groups,
+        primary_key_candidates=pk_candidates,
     )
 
 

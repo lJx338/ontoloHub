@@ -59,12 +59,25 @@ class CandidateProfileItem(BaseModel):
     confidence_level: str
 
 
+class ValueOverlapGroup(BaseModel):
+    """HIA-72 B2: 跨表跨字段同语义分组（值集合高度重合）。
+
+    例：``["users.email", "customers.email"]`` — 不同表，但都是 email 字段。
+    """
+
+    field_names: list[str]
+    min_jaccard: float = 0.0
+
+
 class CandidateGenerationResponse(BaseModel):
     """生成结果"""
 
     proposals_created: int
     proposals_skipped: int
     field_profiles: list[CandidateProfileItem]
+    # HIA-72 B2: 跨表跨字段同语义分组 + 推断出的 primary key 候选
+    value_overlap_groups: list[ValueOverlapGroup] = []
+    primary_key_candidates: list[str] = []
 
 
 # =====================================================================
@@ -110,6 +123,10 @@ async def generate_from_profiling(
         field_profiles=[
             CandidateProfileItem(**fp) for fp in result.field_profiles
         ],
+        value_overlap_groups=[
+            ValueOverlapGroup(field_names=g) for g in result.value_overlap_groups
+        ],
+        primary_key_candidates=result.primary_key_candidates,
     )
 
 
@@ -140,6 +157,10 @@ async def generate_from_evidence(
         field_profiles=[
             CandidateProfileItem(**fp) for fp in result.field_profiles
         ],
+        value_overlap_groups=[
+            ValueOverlapGroup(field_names=g) for g in result.value_overlap_groups
+        ],
+        primary_key_candidates=result.primary_key_candidates,
     )
 
 

@@ -79,7 +79,6 @@ from src.services.shacl import (
     _normalize_severity,
     Violation,
     ValidationResult,
-    _SHAPE_CACHE,
 )
 
 

@@ -691,3 +691,53 @@ async def heavy_compute(field: dict) -> dict:
 - 这份文件本身有错、或遇到新坑没写进来 → **直接改**；不要在 PR 评论里口头说。
 - 改了约定但没更新本文件 → 评审时会被打回。
 - 命名 / 路径 / 工具变更，先改本文件再改代码。
+
+## 12. 字段值相似度（HIA-72 B2）
+
+### 12.1 什么时候用这些 helper
+
+`src/services/candidates.py` 里的相似度 helpers 用于：
+
+- **字段语义推断增强**：email/name/phone 等字段的值集合重合度高 → 跨表同语义字段检测
+- **Primary Key 候选识别**：高 unique_ratio + 低 null_ratio + 特定字段名模式
+- **置信度校准**：值集合高重合的字段互相加分（boost confidence）
+
+### 12.2 四个核心 helper
+
+| helper | 用途 | 返回值 |
+|---|---|---|
+| `_normalize_value(v)` | 归一化：None/空/null → None；str→lowercase+strip；int→str | `Optional[str]` |
+| `_jaccard_similarity(set_a, set_b)` | 集合重合度 | `float` [0,1] |
+| `_levenshtein_ratio(s1, s2)` | 字符串编辑距离相似度 | `float` [0,1] |
+| `_field_value_overlap_ratio(field_a, field_b)` | 两字段 sample_values 的 Jaccard | `float` [0,1] |
+| `_is_likely_primary_key(field)` | PK 候选判定 | `bool` |
+| `_group_fields_by_value_overlap(fields)` | union-find 分组（同语义字段归组） | `list[list[str]]` |
+
+### 12.3 Jaccard 阈值约定
+
+`_FIELD_VALUE_OVERLAP_THRESHOLD = 0.7`
+
+- ≥ 0.7 才视为"同语义"（经验值：两字段 70% 以上值重叠才可靠）
+- 低于阈值：各自独立字段，不分组
+- 跨表跨文件时先按字段名 + 数据类型过滤，再算 Jaccard（减少噪音）
+
+### 12.4 PK 候选判定规则
+
+满足任一即判为 PK：
+
+1. **字段名模式**：`id`、`*_id`、`uuid`、`*_code`、`*_key`、`no`、`*_no`（正则匹配）
+2. **高唯一 + 基本不空**：unique_ratio > 0.95 AND null_ratio < 0.1 AND 数据类型 string/int
+3. **极高唯一**：unique_ratio > 0.9 AND null_ratio < 0.05
+
+### 12.5 置信度加成规则
+
+跨字段 Jaccard ≥ 0.7 时，confidence 额外 + `(overlap - 0.7) * 0.33`，封顶 +0.1。
+
+示例：`label` 类型 baseline = 0.6，与其他字段 Jaccard = 0.85 → bonus = 0.05 → 最终 0.65。
+
+### 12.6 避坑
+
+- `_group_fields_by_value_overlap` 是 `O(n²)`，但 n 是字段数（一般 ≤ 50），可接受。
+  如果未来扩展到大数据集，改为倒排索引。
+- 字段值为 None/""/"null"/"nan" 的样本在 Jaccard 前会被过滤掉。
+- `_is_likely_primary_key` 的高唯一判定要求 null_ratio 低 — 有大量 NULL 的"唯一"字段（如 optional_ref）不算 PK。
