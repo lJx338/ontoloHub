@@ -23,7 +23,16 @@ from .mapping import MappingVersion, IdentityMapping, DatasetSnapshot
 from .object_ import Object, Link
 from .validation import MappingFixture, ValidationRun, SavedQuery, ExpectedResult
 from .runtime import ObjectView, ActionType, ActionRun, AutomationRule, Task
-from .release import ChangeRequest, Release, UseCaseBundle, Deployment, PreflightReport
+from .release import (
+    ChangeRequest,
+    ChangeRequestReviewer,
+    ChangeRequestComment,
+    ReviewerStatus,
+    Release,
+    UseCaseBundle,
+    Deployment,
+    PreflightReport,
+)
 from .governance import PluginInstallation, AuditEvent, DriftProposal, HealthSnapshot
 from .identity import User, Membership, GlobalRole, Role, has_role
 from .connector import Connector, ConnectorType, ConnectorStatus
@@ -78,8 +87,11 @@ __all__ = [
     "ActionRun",
     "AutomationRule",
     "Task",
-    # ??
+    # CR
     "ChangeRequest",
+    "ChangeRequestReviewer",
+    "ChangeRequestComment",
+    "ReviewerStatus",
     "Release",
     "UseCaseBundle",
     "Deployment",

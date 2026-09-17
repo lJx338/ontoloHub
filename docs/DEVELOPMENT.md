@@ -518,6 +518,122 @@ handler `raise HTTPException` 会自动 rollback。不要自己 `async with sess
 - 或每个用到的 test 方法里都加一行 `from src.services.foo import _helper`。
 - 别抄 "前面那个测试里有 import 了" 的代码 — 那份 import 只对那个 method 有效。
 
+### 6.23 Alembic `op.create_index(checkfirst=True)` 不存在 — `checkfirst` 只对 `op.create_table` 有效
+
+**症状**：跑 `alembic upgrade head` 报
+`TypeError: Additional arguments should be named <dialectname>_<argument>, got 'checkfirst'`。
+
+**原因**：`op.create_index` 不接受 `checkfirst=True`。该参数是
+`op.create_table` 的；index 在 SQLite 上也没有 `IF NOT EXISTS` 原生语法。
+
+**规避**：自己包一层 helper：
+
+```python
+def _has_index(table: str, index_name: str) -> bool:
+    bind = op.get_bind()
+    insp = sqla_inspect(bind)
+    return any(idx["name"] == index_name for idx in insp.get_indexes(table))
+
+
+def _create_index_safe(name: str, table: str, columns: list[str], **kw) -> None:
+    if _has_index(table, name):
+        return
+    op.create_index(name, table, columns, **kw)
+```
+
+### 6.24 给现有 PG enum 加值必须用 `ALTER TYPE ... ADD VALUE`，且在事务外执行
+
+**症状**：要给现有 enum 加新值，`UPDATE` / `INSERT` 写新值时报
+`InvalidTextRepresentation: invalid input value for enum ...`；或者
+Alembic 跑迁移时报 `ALTER TYPE ... ADD cannot run inside a transaction block`。
+
+**原因**：
+
+- PG 12-：`ALTER TYPE ... ADD VALUE` 不能在事务块里跑（需要 implicit
+  commit），而 Alembic 默认每个 migration 包一个事务。
+- 改了 SQLAlchemy model 的 enum 不改 PG enum type，DB 端 CHECK 不到。
+
+**规避**：
+
+```python
+if _is_postgres():
+    bind = op.get_bind()
+    with bind.connect() as conn:
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+        for new_value in ("submitted", "changes_requested", "closed"):
+            conn.execute(sa.text(
+                f"ALTER TYPE change_request_status "
+                f"ADD VALUE IF NOT EXISTS '{new_value}'"
+            ))
+```
+
+- **PG 9.6+** 才支持 `IF NOT EXISTS`，老版本需要先查 `pg_enum` 决定要不要加。
+- **降级不要尝试 `ALTER TYPE DROP VALUE`**（PG 12- 不允许事务内执行；
+  12+ 允许但会强制 cascade，丢历史数据）。保留扩展值无害 — 应用层不再写就行。
+- SQLite 上 enum 是字符串 + CHECK 约束；改 Python enum 后 `Base.metadata.create_all`
+  不会重建表，需要 drop_column + add_column 才能改 CHECK。**建议在 SQLite 上不依赖 enum 约束**，
+  让 Python 端做校验。
+
+### 6.25 CR 状态机：`SUBMITTED → APPROVED` 不能由「全部 reviewer 都投票」一步触发
+
+**症状**：写多 reviewer 自动合并时，把所有 reviewer approve 的逻辑直接
+塞在 `POST /change-requests/{id}/approve`（全局 approve）端点里 —
+配了多 reviewer 的 CR 也走这条路，结果第二个 reviewer 投了之后又走一
+遍「全局 approve」，状态正确但 `approved_by` 被覆盖成 admin，不是
+reviewer 自己。
+
+**原因**：混淆了「全局 approve」（无 reviewer 配置时一键通过）和
+「per-reviewer approve」（多 reviewer 工作流中的单人投票）。两套路径
+互相覆盖了对方的副作用。
+
+**规避**：
+
+- `POST /change-requests/{id}/approve` — 保留给 `required_approvers == 0`
+  或「无 reviewer 配置」场景；多 reviewer 时返回 400 引导客户端走另一
+  个端点。
+- `POST /change-requests/{id}/reviewers/{rid}/approve` — per-reviewer
+  投票。每次调用：
+  1. 把该 reviewer 状态置 `APPROVED`，写 `reviewed_at`。
+  2. 调 `_maybe_auto_merge(cr, session)`：如果「APPROVED 计数 >=
+     required_approvers」就把 CR 升级到 `APPROVED`，**并把 `approved_by`
+     记成「最后那个把 CR 推过线」的 reviewer**（避免覆盖）。
+- 重提交流程：作者改完点 re-submit → CR 从 `CHANGES_REQUESTED` 回到
+  `SUBMITTED`，**所有 reviewer 状态重置为 `PENDING`**，否则上一次的
+  `APPROVED` 票会让 `_approved_reviewer_count` 立刻满足 → 跳过 review。
+- 状态机边界：merge / close 是终态，不能从 `MERGED` / `CLOSED` 继续
+  approve / reject；端点层必须校验当前状态。
+
+### 6.26 SQLAlchemy relationship `back_populates` 配 self-referential 模型（评论线程）容易循环
+
+**症状**：写 threaded comment 时
+`ChangeRequestComment.replies = relationship("ChangeRequestComment", back_populates="comment")`，
+启动报 `InvalidRequestError: Mapper ... has no property 'comment'` 或
+死循环 import。
+
+**原因**：self-referential 模型加 `back_populates` 必须两边都写，且父
+端加 `remote_side=[Column]`；不然 SQLAlchemy 没法判定谁是父谁是子。
+
+**规避**：adjacency-list threaded comment 通常**只配单向 relationship** —
+`replies = relationship("ChangeRequestComment", cascade="all, delete-orphan")`
+但**不**加 `back_populates`；查询时显式 `WHERE parent_id == ?`。本仓
+`ChangeRequestComment.replies` 就是这么写的。
+
+如果一定要双向，加：
+
+```python
+replies: Mapped[List["ChangeRequestComment"]] = relationship(
+    "ChangeRequestComment",
+    back_populates="parent",
+    remote_side=[id],  # 父端
+    cascade="all, delete-orphan",
+)
+parent: Mapped["ChangeRequestComment"] = relationship(
+    "ChangeRequestComment",
+    back_populates="replies",
+    remote_side=[ChangeRequestComment.parent_id],
+)
+```
+
 ---
 
 ## 7. 工具链 / 环境陷阱
@@ -823,3 +939,71 @@ async def heavy_compute(field: dict) -> dict:
   如果未来扩展到大数据集，改为倒排索引。
 - 字段值为 None/""/"null"/"nan" 的样本在 Jaccard 前会被过滤掉。
 - `_is_likely_primary_key` 的高唯一判定要求 null_ratio 低 — 有大量 NULL 的"唯一"字段（如 optional_ref）不算 PK。
+
+## 13. CR 工作流（HIA-69 / B5）
+
+### 13.1 状态机
+
+```
+DRAFT ──submit──▶ SUBMITTED ──approve──▶ APPROVED ──merge──▶ MERGED  (终态)
+  │                  │
+  │                  ├─changes_requested─▶ CHANGES_REQUESTED ──┐
+  │                  │                                          │
+  │                  └─close─▶ CLOSED (终态) ◀─close────────────┤
+  │                                                           │
+  └─close─▶ CLOSED (终态) ◀────────────────────────────────────┘
+```
+
+- `DRAFT` — 作者保存但未提交。
+- `SUBMITTED` — open / 待审批。
+- `CHANGES_REQUESTED` — reviewer 要求修改；作者改完可以 re-submit（reviewer 状态重置）。
+- `APPROVED` — 所有 required_approvers 投票通过；等用户点 merge。
+- `MERGED` / `CLOSED` — 终态，不可再变更。
+
+### 13.2 多 reviewer 自动合并
+
+API 两套路径互不覆盖：
+
+- `POST /change-requests/{id}/approve` — 全局 approve。仅当
+  `required_approvers == 0` 或没配 M2M reviewer 时可用；多 reviewer 时
+  返回 400，强制走 per-reviewer 端点。
+- `POST /change-requests/{id}/reviewers/{rid}/approve` — 单 reviewer
+  投票。每次调用都触发 `_maybe_auto_merge(cr, session)`：APPROVED
+  计数 ≥ required_approvers 即升 CR 到 `APPROVED`，并把 `approved_by`
+  记成「最后那个把 CR 推过线的 reviewer」。
+
+**避坑**：re-submit 一定要把所有 reviewer 状态重置成 `PENDING`，否则上
+一轮的 `APPROVED` 票会被 `_approved_reviewer_count` 立刻算上，跳过
+review。详见 §6.25。
+
+### 13.3 评论线程（threaded comments）
+
+`ChangeRequestComment` 是 self-referential adjacency-list 模型：
+
+- 顶级评论：`parent_id = None`。
+- reply：`parent_id` 指向上级评论；服务端校验 `parent_id` 必须指向同 CR 下
+  的评论，否则 400（防止跨 CR 引用）。
+- 软删除：`DELETE` 不真删，把 `deleted_at` 设为当前时间；list 时把
+  `body` 替换成 `"[deleted]"` 保留 thread 结构。
+
+**避坑**：self-referential `relationship` 不要加 `back_populates` —
+SQLAlchemy 判定不了父/子方向，启动报 mapper error。本仓用单向
+`replies = relationship("ChangeRequestComment", cascade="all, delete-orphan")`，
+查询时显式 `WHERE parent_id == ?`。详见 §6.26。
+
+### 13.4 API ↔ Model 一致性
+
+**症状**：模型字段没改但 API 端点已经写好引用新字段 / 新 enum 值 —
+启动时 import 不报错（端点要等真有人调才触发），调用端点报
+`AttributeError: type object 'ChangeRequestStatus' has no attribute 'SUBMITTED'`。
+
+**规避**：API 写完，**立刻**跑一次完整测试套件（不只是新增的测试）；
+或者写一个端点级 smoke test（`from src.api.main import app; print(len(app.routes))`）
+保证 import-time 不爆。具体见 §6.23 + HIA-69 PR description。
+
+### 13.5 迁移：扩展现有 enum
+
+PG 上扩展 enum 用 `ALTER TYPE ... ADD VALUE` 但必须在事务外（Alembic 默认
+包事务 → 用 `execution_options(isolation_level="AUTOCOMMIT")` 绕开）。
+SQLite 上 enum 是字符串 + CHECK 约束，扩展 enum 一般不需要碰 schema —
+应用层校验即可。详见 §6.24。

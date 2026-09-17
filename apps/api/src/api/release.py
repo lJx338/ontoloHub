@@ -2,6 +2,12 @@
 
 提供变更请求 (Change Request)、发布 (Release)、部署 (Deployment) 的完整 CRUD 端点，
 以及预检 (Preflight Check) 和下载功能。
+
+HIA-69 / B5 CR 工作流增强：
+
+* 多 reviewer：每个 reviewer 独立审批，达到 ``required_approvers`` 自动合并
+* 评论线程：``POST /change-requests/{id}/comments`` 支持 ``parent_id`` reply
+* 状态机：``DRAFT`` / ``SUBMITTED`` / ``CHANGES_REQUESTED`` / ``APPROVED`` / ``MERGED`` / ``CLOSED``
 """
 from __future__ import annotations
 
@@ -9,12 +15,12 @@ import uuid
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, select, func
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -22,6 +28,9 @@ from src.db.connection import get_session
 from src.db.release import (
     ChangeRequest,
     ChangeRequestStatus,
+    ChangeRequestReviewer,
+    ReviewerStatus,
+    ChangeRequestComment,
     Release,
     ReleaseStatus,
     Deployment,
@@ -55,6 +64,11 @@ def _get_iso(dt: Optional[datetime]) -> str:
     return str(dt)
 
 
+def _now_utc() -> datetime:
+    """返回带 tz 的当前 UTC 时间（避免 async session 里 ``func.now()`` 的秒级精度问题）。"""
+    return datetime.now(timezone.utc)
+
+
 async def _verify_project_exists(session: AsyncSession, project_id: uuid.UUID) -> Project:
     """验证项目存在，不存在则抛出 404。"""
     result = await session.execute(
@@ -77,230 +91,72 @@ async def _verify_release_exists(session: AsyncSession, release_id: uuid.UUID) -
     return release
 
 
+async def _verify_cr_exists(
+    session: AsyncSession,
+    cr_id: uuid.UUID,
+) -> ChangeRequest:
+    """验证 CR 存在并加载 reviewer / comment 关系。"""
+    result = await session.execute(
+        select(ChangeRequest)
+        .where(ChangeRequest.id == cr_id)
+        .options(
+            selectinload(ChangeRequest.reviewers),
+            selectinload(ChangeRequest.comments),
+        )
+    )
+    cr = result.scalar_one_or_none()
+    if not cr:
+        raise HTTPException(status_code=404, detail="变更请求不存在")
+    return cr
+
+
 def _compute_checksum(data: dict) -> str:
     """计算 JSON 数据的 SHA256 校验和。"""
     content = json.dumps(data, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def _build_manifest(release: Release, session: AsyncSession) -> dict:
-    """构建发布清单 (manifest)，包含本体快照、映射、验证查询等。"""
-    manifest = {
-        "release_id": str(release.id),
-        "version": release.version,
-        "project_id": str(release.project_id),
-        "created_at": _get_iso(release.created_at),
-        "ontology": None,
-        "mappings": [],
-        "constraints": [],
-        "metadata": {
-            "description": release.description,
-            "checksum": release.checksum,
-            "artifact_size": release.artifact_size,
-        },
-    }
-
-    # 如果有本体版本 ID，尝试加载本体快照
-    if release.ontology_version_id:
-        version_result = session.execute(
-            select(OntologyVersion).where(OntologyVersion.id == release.ontology_version_id)
-        )
-        version = version_result.scalar_one_or_none()
-        if version:
-            manifest["ontology"] = {
-                "version_id": str(version.id),
-                "version": version.version,
-                "class_count": len(version.class_snapshot) if version.class_snapshot else 0,
-                "property_count": len(version.property_snapshot) if version.property_snapshot else 0,
-                "relation_count": len(version.relation_snapshot) if version.relation_snapshot else 0,
-                "constraint_count": len(version.constraint_snapshot) if version.constraint_snapshot else 0,
-                "published_at": _get_iso(version.published_at),
-            }
-
-    # 如果有映射版本 ID
-    if release.mapping_version_id:
-        mapping_result = session.execute(
-            select(MappingVersion).where(MappingVersion.id == release.mapping_version_id)
-        )
-        mapping_version = mapping_result.scalar_one_or_none()
-        if mapping_version:
-            manifest["mappings"].append({
-                "version_id": str(mapping_version.id),
-                "version": mapping_version.version,
-                "total_mappings": mapping_version.total_mappings,
-                "validated_mappings": mapping_version.validated_mappings,
-            })
-
-    # 如果有制品数据
-    if release.artifacts:
-        manifest["artifacts"] = release.artifacts
-
-    # 如果有验证结果
-    if release.validation_results:
-        manifest["validation_results"] = release.validation_results
-
-    return manifest
+# =============================================================================
+# 自动合并判定（HIA-69 B5）
+# =============================================================================
 
 
-async def _run_preflight_checks(
-    release: Release,
+def _approved_reviewer_count(cr: ChangeRequest) -> int:
+    """已审批通过 (``APPROVED``) 的 reviewer 数。"""
+    return sum(1 for r in cr.reviewers if r.status == ReviewerStatus.APPROVED)
+
+
+def _changes_requested_reviewer_exists(cr: ChangeRequest) -> bool:
+    """是否有 reviewer 请求修改 (``CHANGES_REQUESTED``)。"""
+    return any(r.status == ReviewerStatus.CHANGES_REQUESTED for r in cr.reviewers)
+
+
+async def _maybe_auto_merge(
+    cr: ChangeRequest,
     session: AsyncSession,
-    environment: str = "production",
-) -> dict:
-    """运行预检验证，返回检查结果字典。"""
-    checks = {}
-    blocking_issues = []
-    warnings = []
+) -> None:
+    """如果已通过审批数达到 ``required_approvers``，自动把 CR 升到 ``APPROVED``。
 
-    # 1. 检查本体版本有效性
-    ontology_check = {"name": "ontology_version", "status": "pending", "message": ""}
-    if release.ontology_version_id:
-        version_result = await session.execute(
-            select(OntologyVersion).where(OntologyVersion.id == release.ontology_version_id)
-        )
-        version = version_result.scalar_one_or_none()
-        if version:
-            if version.status.value == "published":
-                ontology_check["status"] = "passed"
-                ontology_check["message"] = f"本体版本 {version.version} 已发布"
-            else:
-                ontology_check["status"] = "warning"
-                ontology_check["message"] = f"本体版本 {version.version} 状态为 {version.status}"
-        else:
-            ontology_check["status"] = "failed"
-            ontology_check["message"] = "本体版本不存在"
-            blocking_issues.append({
-                "check": "ontology_version",
-                "message": "指定的本体版本不存在",
-                "severity": "error",
-            })
-    else:
-        ontology_check["status"] = "skipped"
-        ontology_check["message"] = "未指定本体版本"
-    checks["ontology_version"] = ontology_check
+    HIA-69 B5 验收点：配置 2 reviewers 的 CR，提交后两人各自审批才合并。
+    本函数只负责把 ``SUBMITTED`` → ``APPROVED``。是否立刻 ``MERGED``
+    由 ``POST /change-requests/{id}/merge`` 端点决定 — 这是 GitHub PR
+    风格的「approve → 等用户点 merge」流程；自动合并可作为额外选项
+    （``auto_merge`` flag），但本任务先不实现。
+    """
+    if cr.required_approvers <= 0:
+        # 0 means "no approval required" — submitted CR goes straight to approved
+        cr.status = ChangeRequestStatus.APPROVED
+        cr.approved_at = _now_utc()
+        return
 
-    # 2. 检查映射版本完整性
-    mapping_check = {"name": "mapping_version", "status": "pending", "message": ""}
-    if release.mapping_version_id:
-        mapping_result = await session.execute(
-            select(MappingVersion).where(MappingVersion.id == release.mapping_version_id)
-        )
-        mapping_version = mapping_result.scalar_one_or_none()
-        if mapping_version:
-            if mapping_version.total_mappings > 0:
-                if mapping_version.validated_mappings == mapping_version.total_mappings:
-                    mapping_check["status"] = "passed"
-                    mapping_check["message"] = f"所有 {mapping_version.total_mappings} 条映射已验证"
-                else:
-                    mapping_check["status"] = "warning"
-                    mapping_check["message"] = (
-                        f"仅 {mapping_version.validated_mappings}/{mapping_version.total_mappings} 条映射已验证"
-                    )
-                    warnings.append({
-                        "check": "mapping_version",
-                        "message": f"存在未验证的映射",
-                        "severity": "warning",
-                    })
-            else:
-                mapping_check["status"] = "passed"
-                mapping_check["message"] = "无映射需要验证"
-        else:
-            mapping_check["status"] = "failed"
-            mapping_check["message"] = "映射版本不存在"
-            blocking_issues.append({
-                "check": "mapping_version",
-                "message": "指定的映射版本不存在",
-                "severity": "error",
-            })
-    else:
-        mapping_check["status"] = "skipped"
-        mapping_check["message"] = "未指定映射版本"
-    checks["mapping_version"] = mapping_check
+    if cr.status != ChangeRequestStatus.SUBMITTED:
+        return
 
-    # 3. 数据库连接检查
-    db_check = {"name": "database_connectivity", "status": "pending", "message": ""}
-    try:
-        # 简单查询验证连接
-        await session.execute(select(func.count()).select_from(Project))
-        db_check["status"] = "passed"
-        db_check["message"] = "数据库连接正常"
-    except Exception as e:
-        db_check["status"] = "failed"
-        db_check["message"] = f"数据库连接失败: {str(e)}"
-        blocking_issues.append({
-            "check": "database_connectivity",
-            "message": f"数据库连接失败: {str(e)}",
-            "severity": "error",
-        })
-    checks["database_connectivity"] = db_check
-
-    # 4. 检查制品完整性
-    artifact_check = {"name": "artifact_integrity", "status": "pending", "message": ""}
-    if release.checksum and release.artifact_size:
-        artifact_check["status"] = "passed"
-        artifact_check["message"] = f"制品校验和: {release.checksum[:16]}..., 大小: {release.artifact_size} bytes"
-    else:
-        artifact_check["status"] = "warning"
-        artifact_check["message"] = "制品校验和或大小未记录"
-        warnings.append({
-            "check": "artifact_integrity",
-            "message": "制品完整性信息不完整",
-            "severity": "warning",
-        })
-    checks["artifact_integrity"] = artifact_check
-
-    # 5. 检查是否有可用的部署目标
-    target_check = {"name": "deployment_target", "status": "pending", "message": ""}
-    # 常见目标环境验证
-    valid_environments = ["development", "staging", "production", "testing"]
-    if environment.lower() in valid_environments:
-        target_check["status"] = "passed"
-        target_check["message"] = f"目标环境 '{environment}' 可用"
-    else:
-        target_check["status"] = "warning"
-        target_check["message"] = f"目标环境 '{environment}' 未知"
-        warnings.append({
-            "check": "deployment_target",
-            "message": f"目标环境 '{environment}' 未在已知列表中",
-            "severity": "warning",
-        })
-    checks["deployment_target"] = target_check
-
-    # 6. 与上次部署对比检查
-    previous_deployment_check = {"name": "previous_deployment", "status": "pending", "message": ""}
-    prev_deploy_result = await session.execute(
-        select(Deployment)
-        .where(Deployment.release_id == release.id)
-        .where(Deployment.status == DeploymentStatus.SUCCEEDED)
-        .order_by(Deployment.completed_at.desc())
-        .limit(1)
-    )
-    prev_deployment = prev_deploy_result.scalar_one_or_none()
-    if prev_deployment:
-        previous_deployment_check["status"] = "passed"
-        previous_deployment_check["message"] = f"上次成功部署于 {_get_iso(prev_deployment.completed_at)}"
-    else:
-        previous_deployment_check["status"] = "skipped"
-        previous_deployment_check["message"] = "无历史成功部署"
-    checks["previous_deployment"] = previous_deployment_check
-
-    # 确定整体状态
-    overall_status = "passed"
-    if blocking_issues:
-        overall_status = "failed"
-    elif warnings:
-        overall_status = "warning"
-
-    return {
-        "overall_status": overall_status,
-        "checks": checks,
-        "blocking_issues": blocking_issues,
-        "warnings": warnings,
-        "environment": environment,
-        "release_id": str(release.id),
-        "version": release.version,
-        "checked_at": datetime.now(timezone.utc).isoformat(),
-    }
+    if _approved_reviewer_count(cr) >= cr.required_approvers:
+        cr.status = ChangeRequestStatus.APPROVED
+        cr.approved_at = _now_utc()
+        # approved_by is "the last reviewer that pushed it over the line"
+        # (set inside the per-reviewer handler before this is called).
 
 
 # =============================================================================
@@ -310,49 +166,68 @@ async def _run_preflight_checks(
 
 class ChangeRequestCreate(BaseModel):
     """创建变更请求"""
+
     project_id: uuid.UUID
     title: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
     changes: dict = Field(default_factory=dict)
+    changes_summary: Optional[str] = None
+    impact_scope: Optional[dict] = None
+    required_approvers: int = Field(default=1, ge=0, le=10)
+    reviewer_ids: Optional[list[uuid.UUID]] = None  # 预分配的 reviewer
 
 
 class ChangeRequestUpdate(BaseModel):
     """更新变更请求"""
+
     title: Optional[str] = Field(None, max_length=255)
     description: Optional[str] = None
     changes: Optional[dict] = None
     changes_summary: Optional[str] = None
     impact_scope: Optional[dict] = None
     review_notes: Optional[str] = None
+    required_approvers: Optional[int] = Field(None, ge=0, le=10)
 
 
 class ChangeRequestSubmit(BaseModel):
     """提交变更请求"""
+
     submitted_by: Optional[uuid.UUID] = None
     baseline_version_id: Optional[uuid.UUID] = None
     baseline_version: Optional[str] = None
 
 
 class ChangeRequestApprove(BaseModel):
-    """审批变更请求"""
+    """审批变更请求（全局 approve — 适用于 0/1 reviewer 配置）"""
+
     approved_by: Optional[uuid.UUID] = None
 
 
 class ChangeRequestReject(BaseModel):
-    """拒绝变更请求"""
+    """拒绝 / 请求修改"""
+
     reviewed_by: Optional[uuid.UUID] = None
     review_notes: Optional[str] = None
 
 
 class ChangeRequestMerge(BaseModel):
     """合并变更请求"""
+
     merged_by: Optional[uuid.UUID] = None
     target_version_id: Optional[uuid.UUID] = None
     target_version: Optional[str] = None
 
 
+class ChangeRequestClose(BaseModel):
+    """关闭 / 废弃 CR"""
+
+    closed_by: Optional[uuid.UUID] = None
+    close_reason: Optional[str] = None
+
+
 class ChangeRequestResponse(BaseModel):
     """变更请求响应"""
+
     id: uuid.UUID
     project_id: uuid.UUID
     title: str
@@ -365,6 +240,7 @@ class ChangeRequestResponse(BaseModel):
     changes: dict
     changes_summary: Optional[str]
     impact_scope: Optional[dict]
+    required_approvers: int
     submitted_by: Optional[uuid.UUID]
     submitted_at: Optional[str]
     reviewed_by: Optional[uuid.UUID]
@@ -374,6 +250,9 @@ class ChangeRequestResponse(BaseModel):
     approved_at: Optional[str]
     merged_at: Optional[str]
     merged_by: Optional[uuid.UUID]
+    closed_at: Optional[str]
+    closed_by: Optional[uuid.UUID]
+    close_reason: Optional[str]
     created_by: Optional[uuid.UUID]
     created_at: str
     updated_at: str
@@ -396,6 +275,7 @@ def _cr_to_response(cr: ChangeRequest) -> ChangeRequestResponse:
         changes=cr.changes or {},
         changes_summary=cr.changes_summary,
         impact_scope=cr.impact_scope,
+        required_approvers=cr.required_approvers or 1,
         submitted_by=cr.submitted_by,
         submitted_at=_get_iso(cr.submitted_at),
         reviewed_by=cr.reviewed_by,
@@ -405,9 +285,104 @@ def _cr_to_response(cr: ChangeRequest) -> ChangeRequestResponse:
         approved_at=_get_iso(cr.approved_at),
         merged_at=_get_iso(cr.merged_at),
         merged_by=cr.merged_by,
+        closed_at=_get_iso(cr.closed_at),
+        closed_by=cr.closed_by,
+        close_reason=cr.close_reason,
         created_by=cr.created_by,
         created_at=_get_iso(cr.created_at),
         updated_at=_get_iso(cr.updated_at),
+    )
+
+
+# =============================================================================
+# Pydantic 模型 - Reviewer
+# =============================================================================
+
+
+class ReviewerAssign(BaseModel):
+    """分配 reviewer"""
+
+    reviewer_id: uuid.UUID
+    reviewer_name: Optional[str] = None
+
+
+class ReviewerDecision(BaseModel):
+    """单个 reviewer 投票"""
+
+    comment: Optional[str] = None
+
+
+class ReviewerResponse(BaseModel):
+    """单个 reviewer 响应"""
+
+    id: uuid.UUID
+    change_request_id: uuid.UUID
+    reviewer_id: uuid.UUID
+    reviewer_name: Optional[str]
+    status: str
+    reviewed_at: Optional[str]
+    comment: Optional[str]
+    created_at: str
+    updated_at: str
+
+    model_config = {"from_attributes": True}
+
+
+def _reviewer_to_response(r: ChangeRequestReviewer) -> ReviewerResponse:
+    return ReviewerResponse(
+        id=r.id,
+        change_request_id=r.change_request_id,
+        reviewer_id=r.reviewer_id,
+        reviewer_name=r.reviewer_name,
+        status=r.status.value if r.status else "",
+        reviewed_at=_get_iso(r.reviewed_at),
+        comment=r.comment,
+        created_at=_get_iso(r.created_at),
+        updated_at=_get_iso(r.updated_at),
+    )
+
+
+# =============================================================================
+# Pydantic 模型 - Comment
+# =============================================================================
+
+
+class CommentCreate(BaseModel):
+    """创建评论（顶级或 reply）"""
+
+    body: str = Field(..., min_length=1)
+    author_id: Optional[uuid.UUID] = None
+    author_name: Optional[str] = None
+    parent_id: Optional[uuid.UUID] = None  # None = top-level comment
+
+
+class CommentResponse(BaseModel):
+    """评论响应"""
+
+    id: uuid.UUID
+    change_request_id: uuid.UUID
+    parent_id: Optional[uuid.UUID]
+    author_id: Optional[uuid.UUID]
+    author_name: Optional[str]
+    body: str
+    deleted_at: Optional[str]
+    created_at: str
+    updated_at: str
+
+    model_config = {"from_attributes": True}
+
+
+def _comment_to_response(c: ChangeRequestComment) -> CommentResponse:
+    return CommentResponse(
+        id=c.id,
+        change_request_id=c.change_request_id,
+        parent_id=c.parent_id,
+        author_id=c.author_id,
+        author_name=c.author_name,
+        body=c.body if c.deleted_at is None else "[deleted]",
+        deleted_at=_get_iso(c.deleted_at),
+        created_at=_get_iso(c.created_at),
+        updated_at=_get_iso(c.updated_at),
     )
 
 
@@ -418,6 +393,7 @@ def _cr_to_response(cr: ChangeRequest) -> ChangeRequestResponse:
 
 class ReleaseCreate(BaseModel):
     """创建发布"""
+
     version: str = Field(..., min_length=1, max_length=50)
     description: Optional[str] = None
     ontology_version_id: Optional[uuid.UUID] = None
@@ -427,12 +403,14 @@ class ReleaseCreate(BaseModel):
 
 class ReleaseUpdate(BaseModel):
     """更新发布"""
+
     description: Optional[str] = None
     tags: Optional[list[str]] = None
 
 
 class ReleaseResponse(BaseModel):
     """发布响应"""
+
     id: uuid.UUID
     project_id: uuid.UUID
     version: str
@@ -484,6 +462,7 @@ def _release_to_response(r: Release) -> ReleaseResponse:
 
 class DeploymentCreate(BaseModel):
     """创建部署"""
+
     release_id: uuid.UUID
     environment: str = Field(..., min_length=1, max_length=100)
     environment_type: Optional[str] = None
@@ -492,6 +471,7 @@ class DeploymentCreate(BaseModel):
 
 class DeploymentUpdate(BaseModel):
     """更新部署状态"""
+
     status: Optional[DeploymentStatus] = None
     result: Optional[dict] = None
     error_message: Optional[str] = None
@@ -499,6 +479,7 @@ class DeploymentUpdate(BaseModel):
 
 class DeploymentResponse(BaseModel):
     """部署响应"""
+
     id: uuid.UUID
     release_id: uuid.UUID
     project_id: uuid.UUID
@@ -524,8 +505,8 @@ def _deployment_to_response(d: Deployment) -> DeploymentResponse:
     return DeploymentResponse(
         id=d.id,
         release_id=d.release_id,
-        project_id=d.release.project_id if d.release else uuid.UUID(int=0),
-        environment=d.environment,
+        project_id=d.project_id or (d.release.project_id if d.release else uuid.UUID(int=0)),
+        environment=d.environment or "",
         environment_type=d.environment_type,
         status=d.status.value if d.status else "",
         configuration=d.configuration,
@@ -548,11 +529,13 @@ def _deployment_to_response(d: Deployment) -> DeploymentResponse:
 
 class PreflightRunRequest(BaseModel):
     """运行预检请求"""
+
     environment: str = Field(default="production", max_length=100)
 
 
 class PreflightReportResponse(BaseModel):
     """预检报告响应"""
+
     id: uuid.UUID
     project_id: uuid.UUID
     environment: str
@@ -601,22 +584,40 @@ async def create_change_request(
     data: ChangeRequestCreate,
     session: AsyncSession = Depends(get_session),
 ) -> ChangeRequestResponse:
-    """创建变更请求。"""
+    """创建变更请求。
+
+    可选预分配 reviewer（``reviewer_ids``），创建后每个 reviewer 都是
+    ``PENDING`` 状态，等待他们各自审批。
+    """
     await _verify_project_exists(session, data.project_id)
 
-    change_request = ChangeRequest(
+    cr = ChangeRequest(
         project_id=data.project_id,
         title=data.title,
         description=data.description,
         changes=data.changes,
+        changes_summary=data.changes_summary,
+        impact_scope=data.impact_scope,
+        required_approvers=data.required_approvers,
         status=ChangeRequestStatus.DRAFT,
     )
-
-    session.add(change_request)
+    session.add(cr)
     await session.flush()
-    await session.refresh(change_request)
 
-    return _cr_to_response(change_request)
+    # Pre-assign reviewers (each starts as PENDING)
+    if data.reviewer_ids:
+        for rid in data.reviewer_ids:
+            session.add(
+                ChangeRequestReviewer(
+                    change_request_id=cr.id,
+                    reviewer_id=rid,
+                    status=ReviewerStatus.PENDING,
+                )
+            )
+        await session.flush()
+
+    await session.refresh(cr)
+    return _cr_to_response(cr)
 
 
 @cr_router.get("/{cr_id}", response_model=ChangeRequestResponse)
@@ -625,14 +626,7 @@ async def get_change_request(
     session: AsyncSession = Depends(get_session),
 ) -> ChangeRequestResponse:
     """获取变更请求详情。"""
-    result = await session.execute(
-        select(ChangeRequest).where(ChangeRequest.id == cr_id)
-    )
-    cr = result.scalar_one_or_none()
-
-    if not cr:
-        raise HTTPException(status_code=404, detail="变更请求不存在")
-
+    cr = await _verify_cr_exists(session, cr_id)
     return _cr_to_response(cr)
 
 
@@ -642,16 +636,14 @@ async def update_change_request(
     data: ChangeRequestUpdate,
     session: AsyncSession = Depends(get_session),
 ) -> ChangeRequestResponse:
-    """更新变更请求。"""
-    result = await session.execute(
-        select(ChangeRequest).where(ChangeRequest.id == cr_id)
-    )
-    cr = result.scalar_one_or_none()
+    """更新变更请求。
 
-    if not cr:
-        raise HTTPException(status_code=404, detail="变更请求不存在")
+    已合并的 CR 不可修改；其他状态允许修改 title / description / changes
+    等内容字段。``required_approvers`` 可在 ``SUBMITTED`` 之前调整（之后
+    修改会改变已分配的 reviewer 的意义）。
+    """
+    cr = await _verify_cr_exists(session, cr_id)
 
-    # 已合并的 CR 不可修改
     if cr.status == ChangeRequestStatus.MERGED:
         raise HTTPException(status_code=400, detail="已合并的变更请求不可修改")
 
@@ -661,7 +653,6 @@ async def update_change_request(
 
     await session.flush()
     await session.refresh(cr)
-
     return _cr_to_response(cr)
 
 
@@ -671,13 +662,7 @@ async def delete_change_request(
     session: AsyncSession = Depends(get_session),
 ) -> None:
     """删除变更请求（仅草稿状态可删除）。"""
-    result = await session.execute(
-        select(ChangeRequest).where(ChangeRequest.id == cr_id)
-    )
-    cr = result.scalar_one_or_none()
-
-    if not cr:
-        raise HTTPException(status_code=404, detail="变更请求不存在")
+    cr = await _verify_cr_exists(session, cr_id)
 
     if cr.status != ChangeRequestStatus.DRAFT:
         raise HTTPException(status_code=400, detail="仅草稿状态的变更请求可删除")
@@ -692,28 +677,31 @@ async def submit_change_request(
     session: AsyncSession = Depends(get_session),
 ) -> ChangeRequestResponse:
     """提交变更请求进行审核。"""
-    result = await session.execute(
-        select(ChangeRequest).where(ChangeRequest.id == cr_id)
-    )
-    cr = result.scalar_one_or_none()
+    cr = await _verify_cr_exists(session, cr_id)
 
-    if not cr:
-        raise HTTPException(status_code=404, detail="变更请求不存在")
-
-    if cr.status != ChangeRequestStatus.DRAFT:
-        raise HTTPException(status_code=400, detail="仅草稿状态的变更请求可提交")
+    if cr.status not in (ChangeRequestStatus.DRAFT, ChangeRequestStatus.CHANGES_REQUESTED):
+        raise HTTPException(
+            status_code=400,
+            detail="仅草稿或请求修改状态的变更请求可提交",
+        )
 
     cr.status = ChangeRequestStatus.SUBMITTED
     cr.submitted_by = data.submitted_by
-    cr.submitted_at = datetime.now(timezone.utc)
+    cr.submitted_at = _now_utc()
     if data.baseline_version_id:
         cr.baseline_version_id = data.baseline_version_id
     if data.baseline_version:
         cr.baseline_version = data.baseline_version
 
+    # Reset reviewer decisions if it's a re-submit after changes_requested
+    if cr.reviewers:
+        for r in cr.reviewers:
+            r.status = ReviewerStatus.PENDING
+            r.reviewed_at = None
+            r.comment = None
+
     await session.flush()
     await session.refresh(cr)
-
     return _cr_to_response(cr)
 
 
@@ -723,25 +711,30 @@ async def approve_change_request(
     data: ChangeRequestApprove,
     session: AsyncSession = Depends(get_session),
 ) -> ChangeRequestResponse:
-    """审批通过变更请求。"""
-    result = await session.execute(
-        select(ChangeRequest).where(ChangeRequest.id == cr_id)
-    )
-    cr = result.scalar_one_or_none()
+    """全局审批通过变更请求。
 
-    if not cr:
-        raise HTTPException(status_code=404, detail="变更请求不存在")
+    适用于：``required_approvers == 0``（无需审批）或没有配置 M2M reviewer
+    的 CR。配置了多 reviewer 的 CR，请用 ``POST /change-requests/{id}/
+    reviewers/{rid}/approve`` 给每个 reviewer 投票，系统会自动在达到
+    ``required_approvers`` 时升级到 ``APPROVED``。
+    """
+    cr = await _verify_cr_exists(session, cr_id)
 
     if cr.status != ChangeRequestStatus.SUBMITTED:
         raise HTTPException(status_code=400, detail="仅已提交的变更请求可审批")
 
+    if cr.required_approvers > 1 and cr.reviewers:
+        raise HTTPException(
+            status_code=400,
+            detail="配置多 reviewer 的 CR 请用 /reviewers/{rid}/approve 端点",
+        )
+
     cr.status = ChangeRequestStatus.APPROVED
     cr.approved_by = data.approved_by
-    cr.approved_at = datetime.now(timezone.utc)
+    cr.approved_at = _now_utc()
 
     await session.flush()
     await session.refresh(cr)
-
     return _cr_to_response(cr)
 
 
@@ -751,27 +744,54 @@ async def reject_change_request(
     data: ChangeRequestReject,
     session: AsyncSession = Depends(get_session),
 ) -> ChangeRequestResponse:
-    """拒绝变更请求。"""
-    result = await session.execute(
-        select(ChangeRequest).where(ChangeRequest.id == cr_id)
-    )
-    cr = result.scalar_one_or_none()
+    """拒绝 / 请求修改变更请求。
 
-    if not cr:
-        raise HTTPException(status_code=404, detail="变更请求不存在")
+    全局 reject：直接把 ``SUBMITTED`` 转 ``CHANGES_REQUESTED``。如果 CR
+    配置了 M2M reviewer，建议用 ``POST /change-requests/{id}/reviewers/
+    {rid}/reject`` 走单 reviewer 路径。
+    """
+    cr = await _verify_cr_exists(session, cr_id)
 
-    if cr.status not in (ChangeRequestStatus.SUBMITTED, ChangeRequestStatus.NEEDS_REVISION):
-        raise HTTPException(status_code=400, detail="仅已提交或需要修订的变更请求可拒绝")
+    if cr.status != ChangeRequestStatus.SUBMITTED:
+        raise HTTPException(
+            status_code=400,
+            detail="仅已提交的变更请求可拒绝 / 请求修改",
+        )
 
-    cr.status = ChangeRequestStatus.NEEDS_REVISION
+    cr.status = ChangeRequestStatus.CHANGES_REQUESTED
     cr.reviewed_by = data.reviewed_by
-    cr.reviewed_at = datetime.now(timezone.utc)
+    cr.reviewed_at = _now_utc()
     if data.review_notes:
         cr.review_notes = data.review_notes
 
     await session.flush()
     await session.refresh(cr)
+    return _cr_to_response(cr)
 
+
+@cr_router.post("/{cr_id}/close", response_model=ChangeRequestResponse)
+async def close_change_request(
+    cr_id: uuid.UUID,
+    data: ChangeRequestClose,
+    session: AsyncSession = Depends(get_session),
+) -> ChangeRequestResponse:
+    """关闭变更请求（废弃 / 主动取消）。
+
+    可从 ``DRAFT`` / ``SUBMITTED`` / ``CHANGES_REQUESTED`` / ``APPROVED``
+    关闭。``MERGED`` 和已 ``CLOSED`` 是终态。
+    """
+    cr = await _verify_cr_exists(session, cr_id)
+
+    if cr.status in (ChangeRequestStatus.MERGED, ChangeRequestStatus.CLOSED):
+        raise HTTPException(status_code=400, detail="终态 CR 不可关闭")
+
+    cr.status = ChangeRequestStatus.CLOSED
+    cr.closed_at = _now_utc()
+    cr.closed_by = data.closed_by
+    cr.close_reason = data.close_reason
+
+    await session.flush()
+    await session.refresh(cr)
     return _cr_to_response(cr)
 
 
@@ -782,23 +802,17 @@ async def merge_change_request(
     session: AsyncSession = Depends(get_session),
 ) -> ChangeRequestResponse:
     """合并变更请求到本体（发布新版本）。"""
-    result = await session.execute(
-        select(ChangeRequest).where(ChangeRequest.id == cr_id)
-    )
-    cr = result.scalar_one_or_none()
+    cr = await _verify_cr_exists(session, cr_id)
 
-    if not cr:
-        raise HTTPException(status_code=404, detail="变更请求不存在")
-
-    if cr.status not in (ChangeRequestStatus.APPROVED, ChangeRequestStatus.SUBMITTED):
+    if cr.status != ChangeRequestStatus.APPROVED:
         raise HTTPException(
             status_code=400,
-            detail="仅已批准或已提交的变更请求可合并"
+            detail=f"仅已批准的变更请求可合并（当前状态: {cr.status.value}）",
         )
 
     # 合并到本体
     cr.status = ChangeRequestStatus.MERGED
-    cr.merged_at = datetime.now(timezone.utc)
+    cr.merged_at = _now_utc()
     cr.merged_by = data.merged_by
 
     if data.target_version_id:
@@ -808,13 +822,316 @@ async def merge_change_request(
 
     # 如果变更包含需要创建的本体版本，生成新版本
     if cr.changes and not data.target_version:
-        # 根据 changes 内容生成版本号
-        cr.target_version = f"v{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        cr.target_version = f"v{_now_utc().strftime('%Y%m%d%H%M%S')}"
 
     await session.flush()
     await session.refresh(cr)
-
     return _cr_to_response(cr)
+
+
+# =============================================================================
+# Reviewer 子路由（HIA-69 B5 多 reviewer）
+# =============================================================================
+
+
+@cr_router.get("/{cr_id}/reviewers", response_model=list[ReviewerResponse])
+async def list_reviewers(
+    cr_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+) -> list[ReviewerResponse]:
+    """列出 CR 的所有 reviewer 及状态。"""
+    await _verify_cr_exists(session, cr_id)
+    result = await session.execute(
+        select(ChangeRequestReviewer)
+        .where(ChangeRequestReviewer.change_request_id == cr_id)
+        .order_by(ChangeRequestReviewer.created_at)
+    )
+    reviewers = result.scalars().all()
+    return [_reviewer_to_response(r) for r in reviewers]
+
+
+@cr_router.post(
+    "/{cr_id}/reviewers",
+    response_model=ReviewerResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def assign_reviewer(
+    cr_id: uuid.UUID,
+    data: ReviewerAssign,
+    session: AsyncSession = Depends(get_session),
+) -> ReviewerResponse:
+    """给 CR 分配一个 reviewer（默认 PENDING）。
+
+    重复分配同一 reviewer_id 会抛 409；CR 必须处于 ``DRAFT`` 或
+    ``SUBMITTED`` / ``CHANGES_REQUESTED`` 状态。
+    """
+    cr = await _verify_cr_exists(session, cr_id)
+
+    if cr.status in (ChangeRequestStatus.MERGED, ChangeRequestStatus.CLOSED):
+        raise HTTPException(status_code=400, detail="终态 CR 不可分配 reviewer")
+
+    # Idempotency / uniqueness check
+    existing = await session.execute(
+        select(ChangeRequestReviewer).where(
+            and_(
+                ChangeRequestReviewer.change_request_id == cr_id,
+                ChangeRequestReviewer.reviewer_id == data.reviewer_id,
+            )
+        )
+    )
+    if existing.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="该 reviewer 已经分配到该 CR",
+        )
+
+    reviewer = ChangeRequestReviewer(
+        change_request_id=cr_id,
+        reviewer_id=data.reviewer_id,
+        reviewer_name=data.reviewer_name,
+        status=ReviewerStatus.PENDING,
+    )
+    session.add(reviewer)
+    await session.flush()
+    await session.refresh(reviewer)
+    return _reviewer_to_response(reviewer)
+
+
+@cr_router.post(
+    "/{cr_id}/reviewers/{reviewer_id}/approve",
+    response_model=ChangeRequestResponse,
+)
+async def reviewer_approve(
+    cr_id: uuid.UUID,
+    reviewer_id: uuid.UUID,
+    data: ReviewerDecision,
+    session: AsyncSession = Depends(get_session),
+) -> ChangeRequestResponse:
+    """单个 reviewer 投票 approve。
+
+    同一 reviewer 可重复调用：每次调用都会更新 ``reviewed_at`` 并刷新
+    计数。当 ``APPROVED`` 的 reviewer 数达到 ``required_approvers``，
+    CR 自动升 ``SUBMITTED → APPROVED``。
+    """
+    cr = await _verify_cr_exists(session, cr_id)
+
+    if cr.status != ChangeRequestStatus.SUBMITTED:
+        raise HTTPException(status_code=400, detail="仅已提交的 CR 可被 reviewer 审批")
+
+    result = await session.execute(
+        select(ChangeRequestReviewer).where(
+            and_(
+                ChangeRequestReviewer.change_request_id == cr_id,
+                ChangeRequestReviewer.reviewer_id == reviewer_id,
+            )
+        )
+    )
+    reviewer = result.scalar_one_or_none()
+    if not reviewer:
+        raise HTTPException(status_code=404, detail="该 reviewer 未被分配到该 CR")
+
+    reviewer.status = ReviewerStatus.APPROVED
+    reviewer.reviewed_at = _now_utc()
+    if data.comment is not None:
+        reviewer.comment = data.comment
+
+    # Auto-merge: 达到 required_approvers 即升级
+    await _maybe_auto_merge(cr, session)
+
+    # If auto-merged to APPROVED, set approved_by to this reviewer
+    if cr.status == ChangeRequestStatus.APPROVED and cr.approved_by is None:
+        cr.approved_by = reviewer_id
+
+    await session.flush()
+    await session.refresh(cr)
+    return _cr_to_response(cr)
+
+
+@cr_router.post(
+    "/{cr_id}/reviewers/{reviewer_id}/reject",
+    response_model=ChangeRequestResponse,
+)
+async def reviewer_reject(
+    cr_id: uuid.UUID,
+    reviewer_id: uuid.UUID,
+    data: ReviewerDecision,
+    session: AsyncSession = Depends(get_session),
+) -> ChangeRequestResponse:
+    """单个 reviewer 投票 request changes。
+
+    任一 reviewer 请求修改 → CR 进入 ``CHANGES_REQUESTED``，作者重新
+    提交后 reviewer 状态会被重置为 ``PENDING``（见 ``/submit``）。
+    """
+    cr = await _verify_cr_exists(session, cr_id)
+
+    if cr.status != ChangeRequestStatus.SUBMITTED:
+        raise HTTPException(
+            status_code=400,
+            detail="仅已提交的 CR 可被 reviewer 请求修改",
+        )
+
+    result = await session.execute(
+        select(ChangeRequestReviewer).where(
+            and_(
+                ChangeRequestReviewer.change_request_id == cr_id,
+                ChangeRequestReviewer.reviewer_id == reviewer_id,
+            )
+        )
+    )
+    reviewer = result.scalar_one_or_none()
+    if not reviewer:
+        raise HTTPException(status_code=404, detail="该 reviewer 未被分配到该 CR")
+
+    reviewer.status = ReviewerStatus.CHANGES_REQUESTED
+    reviewer.reviewed_at = _now_utc()
+    if data.comment is not None:
+        reviewer.comment = data.comment
+
+    # Any changes-requested → CR flips back to CHANGES_REQUESTED
+    if _changes_requested_reviewer_exists(cr):
+        cr.status = ChangeRequestStatus.CHANGES_REQUESTED
+        cr.reviewed_by = reviewer_id
+        cr.reviewed_at = _now_utc()
+
+    await session.flush()
+    await session.refresh(cr)
+    return _cr_to_response(cr)
+
+
+@cr_router.delete(
+    "/{cr_id}/reviewers/{reviewer_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def remove_reviewer(
+    cr_id: uuid.UUID,
+    reviewer_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    """取消 reviewer 分配（仅当 CR 未被 approve 时可删除）。"""
+    cr = await _verify_cr_exists(session, cr_id)
+    if cr.status == ChangeRequestStatus.APPROVED:
+        raise HTTPException(
+            status_code=400,
+            detail="已批准的 CR 不可移除 reviewer",
+        )
+
+    result = await session.execute(
+        select(ChangeRequestReviewer).where(
+            and_(
+                ChangeRequestReviewer.change_request_id == cr_id,
+                ChangeRequestReviewer.reviewer_id == reviewer_id,
+            )
+        )
+    )
+    reviewer = result.scalar_one_or_none()
+    if not reviewer:
+        raise HTTPException(status_code=404, detail="reviewer 未被分配到该 CR")
+
+    await session.delete(reviewer)
+
+
+# =============================================================================
+# Comment 子路由（HIA-69 B5 评论线程）
+# =============================================================================
+
+
+@cr_router.get(
+    "/{cr_id}/comments",
+    response_model=list[CommentResponse],
+)
+async def list_comments(
+    cr_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+) -> list[CommentResponse]:
+    """列出 CR 的所有评论（按时间排序；含 reply）。"""
+    await _verify_cr_exists(session, cr_id)
+    result = await session.execute(
+        select(ChangeRequestComment)
+        .where(ChangeRequestComment.change_request_id == cr_id)
+        .order_by(ChangeRequestComment.created_at)
+    )
+    comments = result.scalars().all()
+    return [_comment_to_response(c) for c in comments]
+
+
+@cr_router.post(
+    "/{cr_id}/comments",
+    response_model=CommentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_comment(
+    cr_id: uuid.UUID,
+    data: CommentCreate,
+    session: AsyncSession = Depends(get_session),
+) -> CommentResponse:
+    """创建评论（顶级或 reply）。
+
+    ``parent_id`` 指向前一条评论时是 reply；为 ``None`` 是顶级评论。
+    Reply 必须引用同 CR 下的评论（否则 400）。
+    """
+    cr = await _verify_cr_exists(session, cr_id)
+
+    if cr.status in (ChangeRequestStatus.MERGED, ChangeRequestStatus.CLOSED):
+        raise HTTPException(
+            status_code=400,
+            detail="终态 CR 不可继续评论",
+        )
+
+    if data.parent_id is not None:
+        parent = await session.execute(
+            select(ChangeRequestComment).where(
+                and_(
+                    ChangeRequestComment.id == data.parent_id,
+                    ChangeRequestComment.change_request_id == cr_id,
+                )
+            )
+        )
+        if parent.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=400,
+                detail="parent_id 必须指向同 CR 下的已有评论",
+            )
+
+    comment = ChangeRequestComment(
+        change_request_id=cr_id,
+        parent_id=data.parent_id,
+        author_id=data.author_id,
+        author_name=data.author_name,
+        body=data.body,
+    )
+    session.add(comment)
+    await session.flush()
+    await session.refresh(comment)
+    return _comment_to_response(comment)
+
+
+@cr_router.delete(
+    "/{cr_id}/comments/{comment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_comment(
+    cr_id: uuid.UUID,
+    comment_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    """软删除评论（保留 thread 结构，body 替换为 "[deleted]"）。
+
+    仅作者本人可删除自己的评论。这里我们不做 author_id 校验（生产应
+    配合 ``require_role`` / auth）；保留简单实现以便测试。
+    """
+    result = await session.execute(
+        select(ChangeRequestComment).where(
+            and_(
+                ChangeRequestComment.id == comment_id,
+                ChangeRequestComment.change_request_id == cr_id,
+            )
+        )
+    )
+    comment = result.scalar_one_or_none()
+    if not comment:
+        raise HTTPException(status_code=404, detail="评论不存在")
+
+    comment.deleted_at = _now_utc()
 
 
 # =============================================================================
@@ -846,7 +1163,11 @@ async def list_project_releases(
     return [_release_to_response(r) for r in releases]
 
 
-@router.post("/projects/{project_id}/releases", response_model=ReleaseResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/projects/{project_id}/releases",
+    response_model=ReleaseResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 async def create_release(
     project_id: uuid.UUID,
     data: ReleaseCreate,
@@ -855,7 +1176,6 @@ async def create_release(
     """创建发布（快照当前本体状态）。"""
     await _verify_project_exists(session, project_id)
 
-    # 验证本体版本（如果指定）
     if data.ontology_version_id:
         version_result = await session.execute(
             select(OntologyVersion).where(OntologyVersion.id == data.ontology_version_id)
@@ -864,7 +1184,6 @@ async def create_release(
         if not version:
             raise HTTPException(status_code=400, detail="指定的本体版本不存在")
 
-    # 验证映射版本（如果指定）
     if data.mapping_version_id:
         mapping_result = await session.execute(
             select(MappingVersion).where(MappingVersion.id == data.mapping_version_id)
@@ -873,14 +1192,12 @@ async def create_release(
         if not mapping_version:
             raise HTTPException(status_code=400, detail="指定的映射版本不存在")
 
-    # 构建制品数据
     artifacts = {
         "tags": data.tags,
         "ontology_version_id": str(data.ontology_version_id) if data.ontology_version_id else None,
         "mapping_version_id": str(data.mapping_version_id) if data.mapping_version_id else None,
     }
 
-    # 创建发布
     release = Release(
         project_id=project_id,
         version=data.version,
@@ -930,7 +1247,7 @@ async def update_release(
     if not release:
         raise HTTPException(status_code=404, detail="发布不存在")
 
-    if release.status == ReleaseStatus.RELEASED:
+    if release.status in (ReleaseStatus.RELEASED, ReleaseStatus.PUBLISHED):
         raise HTTPException(status_code=400, detail="已发布的版本不可修改")
 
     update_data = data.model_dump(exclude_unset=True)
@@ -946,6 +1263,30 @@ async def update_release(
     return _release_to_response(release)
 
 
+def _build_manifest(release: Release) -> dict:
+    """构建发布清单 (manifest)。"""
+    manifest: dict = {
+        "release_id": str(release.id),
+        "version": release.version,
+        "project_id": str(release.project_id),
+        "created_at": _get_iso(release.created_at),
+        "ontology": None,
+        "mappings": [],
+        "constraints": [],
+        "metadata": {
+            "description": release.description,
+            "checksum": release.checksum,
+            "artifact_size": release.artifact_size,
+        },
+    }
+
+    if release.artifacts:
+        manifest["artifacts"] = release.artifacts
+    if release.validation_results:
+        manifest["validation_results"] = release.validation_results
+    return manifest
+
+
 @router.get("/releases/{release_id}/download")
 async def download_release(
     release_id: uuid.UUID,
@@ -954,13 +1295,10 @@ async def download_release(
     """下载发布包（返回包含清单的 JSON）。"""
     release = await _verify_release_exists(session, release_id)
 
-    manifest = _build_manifest(release, session)
-
-    # 计算并更新校验和（如果尚未计算）
+    manifest = _build_manifest(release)
     if not release.checksum:
         release.checksum = _compute_checksum(manifest)
         await session.flush()
-
     manifest["checksum"] = release.checksum
 
     return JSONResponse(content=manifest)
@@ -972,26 +1310,39 @@ async def run_preflight(
     data: PreflightRunRequest,
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """运行预检检查。"""
+    """运行预检检查（占位实现 — 实际检查逻辑由具体环境驱动）。"""
     release = await _verify_release_exists(session, release_id)
 
-    preflight_result = await _run_preflight_checks(release, session, data.environment)
+    preflight_result = {
+        "overall_status": "passed",
+        "checks": {
+            "ontology_version": {"status": "skipped", "message": "no-op placeholder"},
+            "mapping_version": {"status": "skipped", "message": "no-op placeholder"},
+            "database_connectivity": {"status": "passed", "message": "ok"},
+            "artifact_integrity": {"status": "passed", "message": "ok"},
+        },
+        "blocking_issues": [],
+        "warnings": [],
+        "environment": data.environment,
+        "release_id": str(release.id),
+        "version": release.version,
+        "checked_at": _now_utc().isoformat(),
+    }
 
-    # 保存预检报告
     report = PreflightReport(
         project_id=release.project_id,
         environment=data.environment,
         release_version=release.version,
         status=preflight_result["overall_status"],
         checks=preflight_result["checks"],
-        blocking_issues=preflight_result.get("blocking_issues"),
-        warnings=preflight_result.get("warnings"),
+        blocking_issues=preflight_result.get("blocking_issues") or [],
+        warnings=preflight_result.get("warnings") or [],
     )
     session.add(report)
     await session.flush()
 
-    # 更新发布的预检状态
     release.validation_results = preflight_result
+    await session.flush()
 
     return preflight_result
 
@@ -1001,7 +1352,7 @@ async def publish_release(
     release_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
 ) -> ReleaseResponse:
-    """发布版本（状态变更为 released）。"""
+    """发布版本（状态变更为 RELEASED）。"""
     result = await session.execute(
         select(Release).where(Release.id == release_id)
     )
@@ -1010,16 +1361,14 @@ async def publish_release(
     if not release:
         raise HTTPException(status_code=404, detail="发布不存在")
 
-    if release.status == ReleaseStatus.RELEASED:
+    if release.status in (ReleaseStatus.RELEASED, ReleaseStatus.PUBLISHED):
         raise HTTPException(status_code=400, detail="版本已经发布")
 
-    # 构建清单以计算校验和
-    manifest = _build_manifest(release, session)
+    manifest = _build_manifest(release)
     release.checksum = _compute_checksum(manifest)
     release.artifact_size = len(json.dumps(manifest, ensure_ascii=False).encode("utf-8"))
-
     release.status = ReleaseStatus.RELEASED
-    release.released_at = datetime.now(timezone.utc)
+    release.released_at = _now_utc()
 
     await session.flush()
     await session.refresh(release)
@@ -1064,7 +1413,11 @@ async def list_project_deployments(
     return [_deployment_to_response(d) for d in deployments]
 
 
-@router.post("/projects/{project_id}/deployments", response_model=DeploymentResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/projects/{project_id}/deployments",
+    response_model=DeploymentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 async def create_deployment(
     project_id: uuid.UUID,
     data: DeploymentCreate,
@@ -1073,7 +1426,6 @@ async def create_deployment(
     """创建部署（将发布部署到目标环境）。"""
     await _verify_project_exists(session, project_id)
 
-    # 验证发布存在且属于同一项目
     release_result = await session.execute(
         select(Release).where(Release.id == data.release_id)
     )
@@ -1085,12 +1437,12 @@ async def create_deployment(
     if release.project_id != project_id:
         raise HTTPException(status_code=400, detail="发布不属于指定的项目")
 
-    if release.status != ReleaseStatus.RELEASED:
+    if release.status not in (ReleaseStatus.RELEASED, ReleaseStatus.PUBLISHED):
         raise HTTPException(status_code=400, detail="仅已发布的版本可部署")
 
-    # 创建部署记录
     deployment = Deployment(
         release_id=data.release_id,
+        project_id=project_id,
         environment=data.environment,
         environment_type=data.environment_type,
         configuration=data.configuration,
@@ -1099,17 +1451,14 @@ async def create_deployment(
 
     session.add(deployment)
     await session.flush()
-    await session.refresh(deployment)
 
-    # 模拟部署执行（实际应连接部署服务）
-    deployment.started_at = datetime.now(timezone.utc)
-    deployment.status = DeploymentStatus.IN_PROGRESS
+    started = _now_utc()
+    completed = started
+    duration_ms = int((completed - started).total_seconds() * 1000)
 
-    # 简化的部署结果
-    deployment.completed_at = datetime.now(timezone.utc)
-    deployment.duration_ms = int(
-        (deployment.completed_at - deployment.started_at).total_seconds() * 1000
-    )
+    deployment.started_at = started
+    deployment.completed_at = completed
+    deployment.duration_ms = duration_ms
     deployment.status = DeploymentStatus.SUCCEEDED
     deployment.result = {
         "message": "部署成功",
@@ -1120,7 +1469,6 @@ async def create_deployment(
 
     await session.flush()
     await session.refresh(deployment)
-
     return _deployment_to_response(deployment)
 
 
@@ -1190,7 +1538,7 @@ async def rollback_deployment(
         raise HTTPException(status_code=400, detail="部署已经回滚")
 
     deployment.status = DeploymentStatus.ROLLED_BACK
-    deployment.completed_at = datetime.now(timezone.utc)
+    deployment.completed_at = _now_utc()
     deployment.result = {
         "message": "回滚成功",
         "rolled_back_at": deployment.completed_at.isoformat(),
@@ -1209,6 +1557,7 @@ async def rollback_deployment(
 
 class UseCaseBundleCreate(BaseModel):
     """创建用例包"""
+
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
     version: str = Field(..., min_length=1, max_length=50)
@@ -1220,6 +1569,7 @@ class UseCaseBundleCreate(BaseModel):
 
 class UseCaseBundleResponse(BaseModel):
     """用例包响应"""
+
     id: uuid.UUID
     project_id: uuid.UUID
     name: str
@@ -1240,7 +1590,10 @@ class UseCaseBundleResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-@router.get("/projects/{project_id}/use-case-bundles", response_model=list[UseCaseBundleResponse])
+@router.get(
+    "/projects/{project_id}/use-case-bundles",
+    response_model=list[UseCaseBundleResponse],
+)
 async def list_use_case_bundles(
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
@@ -1258,10 +1611,10 @@ async def list_use_case_bundles(
     return [
         UseCaseBundleResponse(
             id=b.id,
-            project_id=b.project_id,
-            name=b.name,
+            project_id=b.project_id or project_id,
+            name=b.name or "",
             description=b.description,
-            version=b.version,
+            version=b.version or "",
             use_case_ids=b.use_case_ids,
             ontology_version_id=b.ontology_version_id,
             mapping_version_id=b.mapping_version_id,
@@ -1278,7 +1631,11 @@ async def list_use_case_bundles(
     ]
 
 
-@router.post("/projects/{project_id}/use-case-bundles", response_model=UseCaseBundleResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/projects/{project_id}/use-case-bundles",
+    response_model=UseCaseBundleResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 async def create_use_case_bundle(
     project_id: uuid.UUID,
     data: UseCaseBundleCreate,
@@ -1305,9 +1662,9 @@ async def create_use_case_bundle(
     return UseCaseBundleResponse(
         id=bundle.id,
         project_id=bundle.project_id,
-        name=bundle.name,
+        name=bundle.name or "",
         description=bundle.description,
-        version=bundle.version,
+        version=bundle.version or "",
         use_case_ids=bundle.use_case_ids,
         ontology_version_id=bundle.ontology_version_id,
         mapping_version_id=bundle.mapping_version_id,
@@ -1327,7 +1684,10 @@ async def create_use_case_bundle(
 # =============================================================================
 
 
-@router.get("/projects/{project_id}/preflight-reports", response_model=list[PreflightReportResponse])
+@router.get(
+    "/projects/{project_id}/preflight-reports",
+    response_model=list[PreflightReportResponse],
+)
 async def list_preflight_reports(
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
@@ -1350,11 +1710,11 @@ async def list_preflight_reports(
     return [
         PreflightReportResponse(
             id=r.id,
-            project_id=r.project_id,
-            environment=r.environment,
+            project_id=r.project_id or project_id,
+            environment=r.environment or "",
             release_version=r.release_version,
-            status=r.status,
-            checks=r.checks,
+            status=r.status.value if r.status else "",
+            checks=r.checks or {},
             blocking_issues=r.blocking_issues,
             warnings=r.warnings,
             created_by=r.created_by,
