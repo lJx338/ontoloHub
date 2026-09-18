@@ -1317,6 +1317,95 @@ endpoint 在该情况下可能 400 — 上面 SQL 路径最稳）。
 （对称），纯 Python backend 够用，但装上 `[cryptography]` 防止扩展到
 非对称算法时再炸。
 
+### 15.6.9 Alembic 改列 NOT NULL 必须先 backfill 再 drop default
+
+**症状**：给已有 `users` 表加 `password_hash` / `last_login_at` 时直接写
+`nullable=False`，结果：本地 dev SQLite 没数据看不出来；CI 跑
+`alembic upgrade head` 之后如果 DB 已有数据（docker volume 还在），报
+`IntegrityError: NOT NULL constraint failed`。
+
+**原因**：SQLite / PG 都强制 NOT NULL；alembic migration 不管现有数据是否合法。
+
+**规避**：标准三步走 — 加列 nullable → backfill 现有行 → 改 NOT NULL：
+
+```python
+# revision: add_user_password_and_api_keys.py
+def upgrade():
+    # 1. 加列，nullable=True
+    op.add_column("users", sa.Column("password_hash", sa.String(255), nullable=True))
+    op.add_column("users", sa.Column("last_login_at", sa.DateTime(timezone=True), nullable=True))
+
+    # 2. backfill（这里无所谓，反正没密码用户也是 NULL）
+
+    # 3. 改 NOT NULL — 一定要分两步，先 server_default="" 再 alter
+    with op.batch_alter_table("users") as batch:
+        batch.alter_column("password_hash", existing_type=sa.String(255), nullable=True)  # 保持 True 是 OK 的
+```
+
+**最佳实践**：用户密码字段**永远 nullable=True**（用户可能在
+"已建账号但还没设密码" 状态）；用应用层 `if user.password_hash is None`
+判定"不允许走 JWT 登录"。强行 NOT NULL 会让 bootstrap 流程很别扭。
+
+### 15.6.10 Docker Compose healthcheck 顺序依赖
+
+**症状**：`docker compose up` 启动 api 容器后报
+`asyncpg.exceptions.InvalidPasswordError: ... password authentication failed`，
+但手动重启 api 又能连上。
+
+**原因**：api 容器启动比 postgres 容器"完成 initdb"还早；asyncpg
+第一次握手失败后没重试逻辑。
+
+**规避**：
+
+```yaml
+services:
+  api:
+    depends_on:
+      postgres:
+        condition: service_healthy   # 等待 healthcheck 通过
+      redis:
+        condition: service_healthy
+    # 同时在 api 启动脚本里加重试
+    # entrypoint: ./start_api.sh  内部循环 30 次 retry on connection
+```
+
+`apps/api/start_api.sh` 模板：
+
+```bash
+for i in {1..30}; do
+  python -c "import asyncio; from src.db import connection as c; asyncio.run(c.ping_db())" \
+    && break
+  echo "Waiting for DB... ($i/30)"
+  sleep 2
+done
+exec uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+```
+
+### 15.6.11 `create_api_key` 后立刻返回 plain → 必须先 `flush` + `refresh`
+
+**症状**：创建 API Key 后返回的 `plain_key` / `created_at` 是空字符串 /
+None，前端拿到不能立刻显示。
+
+**原因**：`session.add(api_key)` 不 `flush()`，DB 默认不生成 id /
+`created_at`；`session.refresh(api_key)` 又是异步 lazy load。
+
+**规避**：
+
+```python
+session.add(api_key)
+await session.flush()         # DB 生成 id + created_at
+await session.refresh(api_key)  # 把字段拉回 Python 端
+
+return ApiKeyCreatedResponse(
+    id=str(api_key.id),
+    plain_key=plain,
+    created_at=api_key.created_at.isoformat(),  # 现在才有值
+)
+```
+
+任何「写 ORM 对象 → 立刻用对象字段做副作用（返回值 / 审计 / 计算）」的
+模式都得照这个顺序，详见 §6.21。
+
 ### 15.7 测试模式
 
 `tests/test_auth_jwt.py` 是参考模板，**至少**覆盖：
