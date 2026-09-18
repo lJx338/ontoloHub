@@ -66,11 +66,11 @@ prototype/         # 设计原型，独立维护，不进生产
 
 > 三件套：`get_current_user` → `require_role(min)` → `record_audit(...)`。**每次写新端点都要按顺序想一遍**。
 
-- 认证：调用方传 `X-User-Email`（优先）或 `X-User-Id` header；都缺则 fallback 到 bootstrap admin。**M1 不引入 JWT / OIDC**。
+- 认证优先级（HIA-64 B1 起）：`Authorization: Bearer <jwt>` → `X-API-Key: ont_xxx` → `X-User-Email` → `X-User-Id` → bootstrap admin。前两个走 JWT/API Key 路径（生产），后三个是 dev header fallback（向后兼容 HIA-51 单机阶段）。详见 §15。
 - 授权：每个项目级端点必须挂 `require_role(MIN_ROLE)`；OWNER 才能写成员，EDITOR 才能写业务对象，VIEWER 只能读。
 - 隔离：路径中拿到 `project_id` 后，**所有查询必须再 WHERE `project_id == ?`**；helper `_load_xxx_for_project(session, id=..., project_id=...)` 强制这件事，禁止裸用 `select(Foo).where(Foo.id == id)`。
 - 失败语义：**不足权限 → 404，不返 403**。这是 M1-10 退出条件，避免 "项目是否存在" 侧信道泄漏。
-- 审计：每个**变更**端点（POST / PATCH / DELETE）必须 `await record_audit(...)`，写 before/after + 哈希链；读端点不写。
+- 审计：每个**变更**端点（POST / PATCH / DELETE）必须 `await record_audit(...)`，写 before/after + 哈希链；读端点不写。`record_audit` 的 `project_id` 是 keyword-only **可选**（None 表示全局事件，如 login / api_key 撤销）。
 - 已知避坑：`require_role` 内部把 `project_id` 当 **Path** 读。如果你的路由用 `project_id` 作为 **Query** 参数，必须用 `require_role_query(MIN_ROLE)`（见 `apps/api/src/api/auth.py`）。
 
 ### 2.4 错误处理
@@ -1136,3 +1136,208 @@ snapshot 接口返回的 `rows` 是 `dict[str, Any]`，不能假定服务端的 
 3. **跨项目 → 404**：用其他 project_id 访问 → 404
 4. **类型映射**：PG 类型 → 本体类型映射正确（集成到所有 snapshot-to-evidence 测试）
 5. **统计正确性**：null_ratio / unique_ratio / sample_values 在多行场景下准确
+
+---
+
+## 15. JWT + API Key 认证（HIA-64 B1）
+
+M1 正式引入多用户认证。在 `X-User-Email` dev header 之**上**叠加两条
+生产路径：**JWT**（人交互）+ **API Key**（机器对机器）。两者共存，旧的
+dev header 仍 fallback 工作 — 不会破坏现有 dev / 测试。
+
+### 15.1 认证优先级
+
+`get_current_user` 严格按这个顺序判定，命中后立即返回：
+
+1. `Authorization: Bearer <jwt>` — JWT access token，验证签名 + `type=access` + sub 是有效 active user。
+2. `X-API-Key: ont_xxxxxxxxx...` — API Key，SHA-256 哈希后查 `api_keys.key_hash`；命中且未撤销未过期则取 owner user。
+3. `X-User-Email` — dev header（向后兼容 HIA-51）。
+4. `X-User-Id` — dev header。
+5. bootstrap admin（`admin@ontolohub.local`）— **dev convenience**，生产环境应通过 JWT 登录。
+
+实现见 `apps/api/src/api/auth.py::get_current_user`，**所有路径都复用**同一个 `_make_principal(session, user)` helper（注意是 `async def`，调用必须 `await`）。
+
+### 15.2 JWT
+
+- **库**：`python-jose`（HS256 对称签名）；不要用 `pyjwt` — 项目已统一 jose。
+- **密码哈希**：`passlib[bcrypt]`；**`bcrypt<5.0`**（passlib 1.7.4 不兼容 bcrypt 5.x 的 `__about__` 属性，启动会 warning 但能跑）。
+- **secret 来源**：JWT 优先用 `JWT_SECRET`（env），未设则退到 `SECRET_KEY + "-jwt"` 派生。**生产环境必须显式设 `JWT_SECRET`**，否则重启会丢签名。
+- **双 token**：access TTL 默认 1h；refresh 默认 7d。refresh 仅用于换 access（`POST /api/auth/refresh`），不能直接调业务 API（`type != "access"` 会 401）。
+- **payload**：`sub` 是 user UUID 字符串；`type` ∈ `{"access","refresh"}`；`email` 写进 access 便于审计 / 排查。
+
+```python
+# src/core/auth.py
+def create_access_token(*, subject: str, extra: dict | None = None) -> str: ...
+def create_refresh_token(*, subject: str) -> str: ...
+def decode_token(token: str) -> dict: ...    # 抛 jose.JWTError
+```
+
+### 15.3 API Key
+
+- **格式**：`ont_` + 32 字节 `secrets.token_urlsafe(32)`（约 40 字符总长）。
+- **存储**：DB 存 SHA-256 哈希（`api_keys.key_hash`）；明文只在 `POST /api/api-keys` 创建响应里返回**一次**，list 接口只显示 `key_prefix`。
+- **比对**：用 `hmac.compare_digest` 做 constant-time，避免 timing attack（`src.core.auth.constant_time_eq`）。
+- **生命周期**：可设 `expires_in_days`（1–3650）；撤销走软删（设 `revoked_at`）；`is_active` 属性自动判断"未撤销且未过期"。
+- **作用域**：`scopes: list[str]` 自由文本（M1 不做强校验），常用值：`read` / `write` / `connector` / `admin`。
+- **project 绑定**：`api_keys.project_id` 为 NULL 时是全局 key；非 NULL 时用于 connector 跨项目场景（M1 暂未启用强制 scope，保留字段）。
+
+```python
+plain, key_prefix, key_hash = generate_api_key()
+# 仅 plain 是明文 — 立即返回给用户；DB 只写 key_hash + key_prefix
+api_key = ApiKey(user_id=..., name=..., key_hash=key_hash, key_prefix=key_prefix, scopes=[])
+```
+
+### 15.4 端点
+
+| 端点 | 方法 | 用途 |
+|---|---|---|
+| `/api/auth/login` | POST | 邮箱 + 密码 → access + refresh |
+| `/api/auth/refresh` | POST | refresh token → 新 access + 新 refresh |
+| `/api/auth/me` | GET | 当前用户信息（任意已认证路径都可） |
+| `/api/auth/set-password` | POST | 改自己密码（需 current_password）/ admin 代改别人 |
+| `/api/auth/bootstrap` | POST | 创建 bootstrap admin（HIA-51 兼容，幂等） |
+| `/api/api-keys` | GET / POST | 列 / 创建 API Key |
+| `/api/api-keys/{id}` | DELETE | 撤销 API Key |
+
+挂载在 `apps/api/src/api/auth_jwt.py`，`main.py` 已 include。改路由直接改这个文件。
+
+### 15.5 路由组织 / 命名
+
+- **登录失败语义**：永远 `401 invalid credentials`，**不区分**"邮箱不存在"和"密码错"，防 enumeration（`authenticate_user` 已经统一返回 None）。
+- **改密码**：self 路径**强制**要 `current_password`；admin 代改要 `target_user_id`。两者都没有 → 400。
+- **撤销幂等**：重复 DELETE 已撤销的 key → 204，不报错（前端可放心重试）。
+- **API key 鉴权 401 提示**：`detail="invalid or expired API key"`，不区分"key 不存在"和"过期 / 撤销"。
+
+### 15.6 避坑
+
+#### 15.6.1 `_make_principal` 漏 `await`
+
+**症状**：路由调 `get_current_user` 后访问 `principal.user` 报
+`'coroutine' object has no attribute 'user'`。
+
+**原因**：`get_current_user` 里 `return _make_principal(session, user)` —
+`_make_principal` 是 `async def`，必须 `await`。
+
+**规避**：所有 `return _make_principal(...)` 都写成 `return await _make_principal(...)`。
+`auth.py` 已统一；新加分支时**逐个搜** `return _make_principal`，漏 await 不会被
+类型检查抓到，运行时拿到一个 coroutine。
+
+#### 15.6.2 `record_audit(project_id=...)` 必填 → 全局事件 401
+
+**症状**：`POST /api/auth/login` 写审计时抛
+`TypeError: record_audit() missing 1 required keyword-only argument: 'project_id'`。
+
+**原因**：`record_audit` 原设计为 project-scoped 审计；login / api-key 撤销
+这类**全局事件**没有 project_id。签名里 `project_id: Optional[uuid.UUID]`
+是 keyword-only 但没有默认值，调用方必须显式传。
+
+**规避**：`record_audit` 已把 `project_id` 改默认 `None`；调用方**不传** `project_id`
+即可（None 表示全局事件，落到 `audit_events` 表 `project_id IS NULL` 的链）。
+
+#### 15.6.3 bcrypt 5.x + passlib 1.7.4 不兼容
+
+**症状**：`hash_password("...")` 抛
+`AttributeError: module 'bcrypt' has no attribute '__about__'`（WARN 级别，
+但实际 hash/verify 仍能工作）；或者直接抛
+`ValueError: password cannot be longer than 72 bytes`。
+
+**原因**：passlib 1.7.4 用 `_bcrypt.__about__.__version__` 探测版本，
+bcrypt 5.x 移除了 `__about__`；fallback 路径里有别的隐式 bug，会把密码
+按错误的字节数处理。
+
+**规避**：`requirements.txt` 锁定 `bcrypt<5.0`（或 `bcrypt==4.3.0`）。
+**不要**升 passlib — 上游已停止维护；也不要换 `bcrypt` 直调 — passlib
+的 deprecated 提示还要保留。
+
+#### 15.6.4 JWT secret 在生产环境必须显式
+
+**症状**：dev 环境 JWT 一切正常，部署到生产重启后所有 token 401。
+
+**原因**：默认 `effective_jwt_secret()` 退到 `f"{secret_key}-jwt"` 派生；
+dev 默认 `secret_key="change-me-in-production"`；生产重启 secret_key 不
+稳定 → 派生 secret 变 → 旧 token 全部失效。
+
+**规避**：生产环境 `JWT_SECRET`（独立于 `SECRET_KEY`）必须显式设一个
+稳定的、至少 32 字节的随机串；放进 secrets manager / `.env` 注入。
+
+#### 15.6.5 测试里 bootstrap admin 没密码 → 走 JWT 路径 401
+
+**症状**：测试 fixture 调 `ensure_bootstrap_admin()` 后 admin 立刻调
+`/api/auth/login` 报 401。
+
+**原因**：`authenticate_user` 校验 `user.password_hash` 不为空；
+bootstrap admin 默认 `password_hash = NULL`（"尚未设密码"）。
+
+**规避**：测试要测 JWT 流程前**手动给 admin 设密码**：
+
+```python
+from src.core.auth import hash_password
+from sqlalchemy import select
+from src.db.connection import async_session_factory
+from src.db.identity import User
+
+async with async_session_factory() as s:
+    user = (await s.execute(select(User).where(User.email == "admin@ontolohub.local"))).scalar_one()
+    user.password_hash = hash_password("test-password")
+    s.add(user)
+    await s.commit()
+```
+
+或者走 `POST /api/auth/set-password`（首次需 `current_password=""`，本仓库
+endpoint 在该情况下可能 400 — 上面 SQL 路径最稳）。
+
+#### 15.6.6 `app.include_router(auth_jwt.auth_router)` 不生效？
+
+**症状**：`app.routes` 找不到 `/api/auth/login`，但 `app.openapi()['paths']`
+能看到。
+
+**原因**：FastAPI 把 `include_router` 后的子 router 包装成
+`_IncludedRouter`（Route 子类），不出现在 `app.routes` 里；要查全部
+路由用 OpenAPI schema 或 `app.router.routes`（也含 `_IncludedRouter`）。
+
+**规避**：调试路由用 `app.openapi()['paths']`；写测试不需要关心，挂上就生效。
+
+#### 15.6.7 枚举防御：`invalid credentials` 必须统一定义
+
+**症状**：login 端点把"邮箱不存在"和"密码错"分两个 detail 暴露。
+
+**规避**：所有失败都 `detail="invalid credentials"`。`authenticate_user`
+已经统一返回 None；endpoint 不要因为 `user is None` 拆出 `user_not_found` /
+`wrong_password` 两条 detail。`/api/auth/set-password` 改自己密码时 `detail="current password is wrong"` 也不应暴露原密码是什么。
+
+#### 15.6.8 `python-jose` 选 `cryptography` extra
+
+**症状**：`pip install python-jose` 后 import 报
+`ImportError: cannot import name 'RSAAlgorithm' from 'jose.backends'`。
+
+**原因**：默认 backend 是纯 Python `pyca`，某些算法（RS256 / ES256）需
+要 `cryptography` extra。
+
+**规避**：`pip install "python-jose[cryptography]"`。本仓只用 HS256
+（对称），纯 Python backend 够用，但装上 `[cryptography]` 防止扩展到
+非对称算法时再炸。
+
+### 15.7 测试模式
+
+`tests/test_auth_jwt.py` 是参考模板，**至少**覆盖：
+
+- 登录成功（邮箱+密码 → JWT pair）
+- 登录失败（错密码 / 未知邮箱 — 都返同样的 401）
+- 没密码的用户不能走 JWT 登录（401）
+- `Authorization: Bearer` 鉴权读取 `/me`
+- `X-API-Key` 鉴权读取 `/me`
+- `Bearer` 优先于 `X-API-Key`（同时给两个，Bearer 生效）
+- `refresh_token` → 新 access
+- `access_token` 当 refresh 用 → 401
+- 改自己密码需 current_password；错密码 → 401
+- admin 代改别人密码（target_user_id）
+- API Key：创建只返一次明文 / list 不含明文
+- API Key：revoke 后不能再用
+- API Key：重复撤销幂等
+- API Key：expires_in_days 写进 expires_at
+- API Key：未知 id 撤销 → 404
+
+fixture 模板见 `tests/test_auth_jwt.py::client` — 独立 SQLite + alembic
+upgrade head + bootstrap admin + `ASGITransport`，**不要**复用
+`test_auth_isolation_audit.py` 的 `isolated_app`（它假设 header-based
+认证，JWT 测试需要给 admin 设密码）。
