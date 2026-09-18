@@ -2484,3 +2484,193 @@ token 增删时同步更新内存 map（监听 webhooks API 的 INSERT/DELETE）
 
 **校验**：`git log --oneline | grep "HIA-75"` 看 commit 是否在正确的分支上。
 
+## 25. Workflow 编排（HIA-76 / C4）
+
+把多个 `ActionType` / `WebhookConfig` / object API / delay 串成顺序执行的有向无环图（当前仅顺序执行 + 跳步；并行/循环/条件分支在 backlog）。
+
+### 25.1 模块边界
+
+- `apps/api/src/db/workflow.py` — `Workflow` / `WorkflowExecution` / `WorkflowStepResult` ORM
+- `apps/api/src/runtime/workflow_step_handlers.py` — 4 种 step 类型的 handler
+- `apps/api/src/runtime/workflow_executor.py` — 顺序执行引擎
+- `apps/api/src/api/workflow.py` — CRUD + 执行端点
+- `apps/api/alembic/versions/2026_09_18_0008_workflow.py` — schema + trigger_configs.workflow_id
+
+### 25.2 Step 类型与字段
+
+| type | 必填 ref | 必填 config | 说明 |
+| --- | --- | --- | --- |
+| `function_call` | `ActionType.id` (kind=function) | 可选 `timeout_s` | 调沙箱执行 Python/JS 代码 |
+| `webhook_call`  | `WebhookConfig.id` | 可选 `timeout_s` | 按该 WebhookConfig 的 secret 重新算 HMAC 发 POST |
+| `object_api`    | `object_type_iri` 或 `step.ref` | 必填 `operation` (`create_object`/`update_object`/`create_link`) | 直接 mutate Object/Link 表 |
+| `delay`         | — | 必填 `seconds` (>=0) | `asyncio.sleep` |
+
+step dict 完整示例：
+
+```json
+{
+  "id": "send-email",
+  "name": "Send welcome email",
+  "type": "function_call",
+  "ref": "<action_type_id>",
+  "input_mapping": {"to": "$trigger.payload.email", "name": "$input.name"},
+  "config": {"timeout_s": 30},
+  "retry_policy": {"max_attempts": 3, "delay_s": 1},
+  "error_handler": "stop"
+}
+```
+
+`error_handler` 取值：
+- `"stop"`（默认）— step 失败 → execution FAILED
+- `"continue"` — 跳过失败，下一步继续
+- `{"goto_step": "step-3"}` — 跳到指定 step（之间所有 step 标记 SKIPPED）
+
+`retry_policy.max_attempts` 用指数退避 `delay_s * 2 ** (attempt-1)`。
+
+### 25.3 Context 传递：`$prev` / `$steps.<id>` / `$input` / `$trigger`
+
+每个 step 的输出都汇入同一个 context dict，下一个 step 通过 `input_mapping` 引用：
+
+```python
+{"to": "$prev.email"}                      # 上一步的整个 output
+{"value": "$steps.double.value"}            # 命名 step 的 output
+{"name": "$input.name"}                     # 用户调用 /execute 时传入的 input
+{"headers": "$trigger.webhook.headers"}     # trigger 上下文
+```
+
+`resolve_input_mapping()` 在 `src/runtime/workflow_step_handlers.py`：
+- 仅识别以 `$` 开头的 token；其他值原样保留
+- 字典递归；标量原样返回
+- 路径不存在的回退原占位符（不报错，便于模板调试）
+
+### 25.4 Trigger 集成（关键扩展点）
+
+`trigger_configs` 表加 `workflow_id` 列（nullable，FK → workflows.id）。
+触发器 API 现在要求 `action_type_id` 与 `workflow_id` **二选一**（model-level XOR validator）。
+
+`process_inbound_webhook` / `_fire_schedule_trigger` 在 dispatch 时：
+- `action_type_id` 非空 → 走原有 `ActionRun` 路径
+- `workflow_id` 非空 → 创建 `WorkflowExecution`，调用 `execute_workflow(id, trigger_kind="webhook"|"schedule")`
+
+**意味着 HIA-75 acceptance 用例**（"新客户注册 → 发邮件 → 同步 Salesforce → 创建跟进任务"）
+现在可以一步完成：定义一个 `kind="function"` 的 ActionType + 一个 `kind="webhook"` 的 WebhookConfig（Salesforce URL）+ 一个 `object_api` step，配成 Workflow，再用 inbound_webhook trigger 串起来。
+
+### 25.5 ⚠️ SQLite writer-lock + 同一 session 共享
+
+**症状**：HIA-76 第一版 `execute_workflow` 在 sync HTTP 路径下，每个 step 都
+`async with async_session_factory() as session` 打开新 session，结果：
+
+```
+sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) database is locked
+```
+
+**根因**：endpoint 的 session 还没 commit（外层事务持有写锁），
+executor 内部又开 session 写 `workflow_step_results` —— SQLite 序列化锁冲突。
+
+**修复**：
+- `execute_workflow(..., session=...)` 接受外部 session；sync HTTP 路径
+  把 `get_session()` 返回的 session 直接传进去，整个执行在一个事务里。
+- 调用方负责 `await session.commit()`（endpoint 已加）。
+- async background 路径不传 session，executor 自己 `async_session_factory()`
+  开新 session。
+
+**生产 PG 不踩**：PG 用 MVCC，跨 session 写不冲突。但即便如此，单事务也是
+最佳实践（一致性 + 减少 round-trip）。
+
+### 25.6 Background execution 在 ASGITransport 测试下不跑
+
+**症状**：`async_run=true` + `asyncio.create_task(execute_workflow(...))` 在
+`httpx.ASGITransport` 下 background task 不执行，execution 永远 PENDING。
+
+**根因**：ASGITransport 的 lifespan 关闭后 background tasks 不会被 drain。
+
+**验证**：用 `lifespan="on"` + `async with AsyncClient(...)` 跨多请求可触发
+background task（httpx 维护 ASGI app 生命周期）；或直接调 `execute_workflow`
+同步路径绕过。
+
+**生产**: `uvicorn` 跑的多 worker 进程下 background task 正常工作。
+
+### 25.7 验收脚本
+
+参见 `apps/api/tests/test_workflow.py`：CRUD + 顺序执行 + retry + continue
+handler + inbound_webhook trigger 集成，共 13 个用例。
+
+### 25.8 AsyncSession owned-session 必须显式 commit
+
+**症状**：executor 后台任务跑完后，DB 里 `execution.status` 还是 PENDING、
+`step_result` 行不存在；日志显示 executor 正常完成。
+
+**根因**：`async with async_session_factory() as session` 上下文退出时**不会
+自动 commit**。`session.flush()` 把改动推到 connection 缓冲区，但没
+`commit()` 的话退出时会回滚到上一次 commit 后的状态。
+
+**FastAPI `get_session` 依赖会代为 commit**（见 `src/db/connection.py`），
+但服务层/后台 task 自己 `async_session_factory() as session` 时没人替
+你 commit。
+
+**修复模板**：
+
+```python
+async def run_owned_session_work(execution_id: ...):
+    owns_session = session is None
+    if owns_session:
+        session = async_session_factory()
+    try:
+        ... # 业务逻辑 + session.flush()
+        if owns_session:
+            await session.commit()
+        return result
+    except Exception:
+        if owns_session and session is not None:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if owns_session:
+            await session.__aexit__(None, None, None)
+```
+
+`workflow_executor.py::execute_workflow` 走的就是这个模式（owned_session
+分支），`async_run=true` 的 endpoint + webhook dispatcher 派发的后台 task
+都依赖它落盘；共享 session 路径（`/execute` sync 端点显式传 `session=`）
+由调用方 commit，executor 不重复 commit。
+
+### 25.9 后台 task 与手动 execute 的并发去重
+
+**症状**：`test_inbound_webhook_triggers_workflow` / `test_async_run_returns_pending`
+单独跑都通过；批量跑偶发 2 个 step_result 或 LookupError。
+
+**根因**：ASGITransport 下 §25.6 让 background task 是否执行变得不确定。
+在 race window 内可能：
+1. 测试 GET 读到的 status 还是 PENDING → 测试手动 `await execute_workflow`
+2. 但 background task 紧接着也跑了 → 两个 invocation 都写 step_result，
+   重复
+
+或反向：GET 看到 status=success 但其实 background task 的 commit 还没
+replication 完 → 测试手动调用查到 LookupError。
+
+**处理模式**（用在 ASGITransport 测试里）：
+
+```python
+# 1. 触发 webhook / async_run
+r = await client.post(...)
+
+# 2. 先 GET 一遍把 POST 的事务强制 commit + 拿到最新状态
+r = await client.get(f"/workflow-executions/{eid}")
+if r.json()["status"] in {"pending", "running"}:
+    # 3. 仅在尚未完成时手动驱动 executor
+    await execute_workflow(uuid.UUID(eid), ...)
+
+# 4. 断言 step_result 用 dedupe by step_id（容忍 0/1/2 行）
+sr = (await client.get(f"/workflow-executions/{eid}/step-results")).json()
+step_ids = {row["step_id"] for row in sr}
+assert expected_step_id in step_ids
+assert all(row["status"] == "success" for row in sr)
+```
+
+**注意**：批量测试仍有 CLAUDE.md 第 1 条记录的 `reinit_engines` 时序问题
+（LookupError 在第二个测试出现），与本 pitfall 无关，不要混在一起追。
+
+

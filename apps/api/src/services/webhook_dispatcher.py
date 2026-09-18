@@ -288,13 +288,14 @@ async def process_inbound_webhook(
     """Process an inbound webhook request.
 
     Finds the TriggerConfig with matching INBOUND_WEBHOOK token,
-    creates an ActionRun, and dispatches it.
+    creates an ActionRun OR WorkflowExecution, and dispatches it.
 
     Returns (success, error_message, trigger_config_id).
     """
     from src.db.connection import sync_session_factory
     matched_trigger_id = None
     matched_action_type_id = None
+    matched_workflow_id = None
     matched_project_id = None
     matched_template = None
 
@@ -304,7 +305,7 @@ async def process_inbound_webhook(
     with sync_session_factory() as session:
         result = session.execute(
             _text(
-                "SELECT id, action_type_id, project_id, input_template "
+                "SELECT id, action_type_id, workflow_id, project_id, input_template "
                 "FROM trigger_configs "
                 "WHERE trigger_type = 'INBOUND_WEBHOOK' "
                 "  AND status = 'ACTIVE' "
@@ -316,9 +317,10 @@ async def process_inbound_webhook(
         if row:
             matched_trigger_id = row[0]
             matched_action_type_id = row[1]
-            matched_project_id = row[2]
+            matched_workflow_id = row[2]
+            matched_project_id = row[3]
             try:
-                matched_template = json.loads(row[3]) if row[3] else None
+                matched_template = json.loads(row[4]) if row[4] else None
             except Exception:
                 matched_template = None
 
@@ -327,10 +329,27 @@ async def process_inbound_webhook(
 
     if isinstance(matched_trigger_id, str):
         matched_trigger_id = uuid.UUID(matched_trigger_id)
-    if isinstance(matched_action_type_id, str):
+    if isinstance(matched_action_type_id, str) and matched_action_type_id:
         matched_action_type_id = uuid.UUID(matched_action_type_id)
+    if isinstance(matched_workflow_id, str) and matched_workflow_id:
+        matched_workflow_id = uuid.UUID(matched_workflow_id)
     if isinstance(matched_project_id, str):
         matched_project_id = uuid.UUID(matched_project_id)
+
+    # HIA-76 C4: dispatch to either ActionType or Workflow execution path.
+    if matched_workflow_id:
+        return await _fire_workflow_from_trigger(
+            trigger_id=matched_trigger_id,
+            workflow_id=matched_workflow_id,
+            project_id=matched_project_id,
+            template=matched_template,
+            payload=payload,
+            headers=headers,
+            trigger_kind="webhook",
+        )
+
+    if not matched_action_type_id:
+        return False, "Trigger has no action_type_id or workflow_id", matched_trigger_id
 
     # Load the ActionType (sync)
     # SQLite stores UUID as 32-char hex (no dashes); convert for raw SQL.
@@ -566,7 +585,73 @@ def _cron_field_matches(field: str, value: int, min_val: int, max_val: int) -> b
 
 
 async def _fire_schedule_trigger(trigger: TriggerConfig) -> None:
-    """Fire a schedule trigger by creating an ActionRun."""
+    """Fire a schedule trigger by creating an ActionRun or WorkflowExecution.
+
+    HIA-76 C4: if ``trigger.workflow_id`` is set, create a WorkflowExecution
+    instead of an ActionRun.
+    """
+    # HIA-76 C4: workflow triggers
+    if trigger.workflow_id:
+        wf_id = trigger.workflow_id
+        input_data = _apply_template(trigger.input_template, {
+            "schedule": {
+                "fired_at": datetime.now(timezone.utc).isoformat(),
+                "cron": (trigger.trigger_config or {}).get("cron", ""),
+            },
+        })
+
+        execution_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        # Use raw SQL path (mirrors process_inbound_webhook for consistency)
+        from src.db.connection import sync_session_factory
+        from src.db.workflow import WorkflowExecutionStatus as _WES
+        with sync_session_factory() as session:
+            wf_exists = session.execute(
+                _text("SELECT 1 FROM workflows WHERE id = :id"),
+                {"id": wf_id.hex},
+            ).first()
+            if not wf_exists:
+                logger.warning("Schedule trigger %s: Workflow %s not found", trigger.id, wf_id)
+                return
+            session.execute(
+                _text(
+                    "INSERT INTO workflow_executions "
+                    "(id, project_id, workflow_id, status, trigger_kind, trigger_id, "
+                    " input_context, triggered_by, created_at, updated_at) "
+                    "VALUES (:id, :project_id, :workflow_id, :status, :trigger_kind, :trigger_id, "
+                    "        :input_context, :triggered_by, :now, :now)"
+                ),
+                {
+                    "id": execution_id.hex,
+                    "project_id": trigger.project_id.hex,
+                    "workflow_id": wf_id.hex,
+                    "status": _WES.PENDING.value,
+                    "trigger_kind": "schedule",
+                    "trigger_id": trigger.id.hex,
+                    "input_context": json.dumps(input_data, ensure_ascii=False),
+                    "triggered_by": "schedule",
+                    "now": now.isoformat(),
+                },
+            )
+            session.execute(
+                _text(
+                    "UPDATE trigger_configs SET total_runs = total_runs + 1, last_run_at = :now "
+                    "WHERE id = :id"
+                ),
+                {"id": trigger.id.hex, "now": now.isoformat()},
+            )
+            session.commit()
+
+        from src.runtime.workflow_executor import execute_workflow
+        asyncio.create_task(
+            execute_workflow(execution_id, trigger_kind="schedule", trigger_id=trigger.id)
+        )
+        logger.info(
+            "Schedule trigger fired (workflow): trigger_id=%s workflow_id=%s execution_id=%s",
+            trigger.id, wf_id, execution_id,
+        )
+        return
+
     async with async_session_factory() as session:
         at_result = await session.execute(
             select(ActionType).where(ActionType.id == trigger.action_type_id)
@@ -600,6 +685,87 @@ async def _fire_schedule_trigger(trigger: TriggerConfig) -> None:
 
         asyncio.create_task(_execute_action_run(run.id, action_type))
         logger.info("Schedule trigger fired: trigger_id=%s run_id=%s", trigger.id, run.id)
+
+
+# =============================================================================
+# Workflow trigger dispatch (HIA-76 C4)
+# =============================================================================
+
+
+async def _fire_workflow_from_trigger(
+    trigger_id: uuid.UUID,
+    workflow_id: uuid.UUID,
+    project_id: uuid.UUID,
+    template: Optional[dict],
+    payload: dict,
+    headers: dict,
+    trigger_kind: str,
+) -> tuple[bool, Optional[str], uuid.UUID]:
+    """HIA-76 C4: Trigger a Workflow execution from a TriggerConfig.
+
+    Creates a WorkflowExecution with merged input_context
+    (template + payload + headers), increments trigger stats,
+    and schedules the executor in the background.
+    """
+    from src.db.connection import sync_session_factory
+    from src.db.workflow import WorkflowExecutionStatus as _WES
+
+    merged_input = _apply_template(template, {
+        "webhook" if trigger_kind == "webhook" else "trigger": {
+            "headers": dict(headers) if headers else {},
+            "payload": payload,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
+    })
+
+    execution_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    with sync_session_factory() as session:
+        wf_exists = session.execute(
+            _text("SELECT 1 FROM workflows WHERE id = :id"),
+            {"id": workflow_id.hex},
+        ).first()
+        if not wf_exists:
+            return False, f"Workflow {workflow_id} not found", trigger_id
+
+        session.execute(
+            _text(
+                "INSERT INTO workflow_executions "
+                "(id, project_id, workflow_id, status, trigger_kind, trigger_id, "
+                " input_context, triggered_by, created_at, updated_at) "
+                "VALUES (:id, :project_id, :workflow_id, :status, :trigger_kind, :trigger_id, "
+                "        :input_context, :triggered_by, :now, :now)"
+            ),
+            {
+                "id": execution_id.hex,
+                "project_id": project_id.hex,
+                "workflow_id": workflow_id.hex,
+                "status": _WES.PENDING.value,
+                "trigger_kind": trigger_kind,
+                "trigger_id": trigger_id.hex,
+                "input_context": json.dumps(merged_input, ensure_ascii=False),
+                "triggered_by": trigger_kind,
+                "now": now.isoformat(),
+            },
+        )
+        session.execute(
+            _text(
+                "UPDATE trigger_configs SET total_runs = total_runs + 1, last_run_at = :now "
+                "WHERE id = :id"
+            ),
+            {"id": trigger_id.hex, "now": now.isoformat()},
+        )
+        session.commit()
+
+    from src.runtime.workflow_executor import execute_workflow
+    asyncio.create_task(
+        execute_workflow(execution_id, trigger_kind=trigger_kind, trigger_id=trigger_id)
+    )
+    logger.info(
+        "Workflow trigger fired: trigger_id=%s workflow_id=%s execution_id=%s",
+        trigger_id, workflow_id, execution_id,
+    )
+    return True, None, trigger_id
 
 
 # =============================================================================

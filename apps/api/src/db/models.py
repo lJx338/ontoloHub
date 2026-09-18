@@ -45,6 +45,15 @@ from .webhook import (
     TriggerType,
     TriggerStatus,
 )
+from .workflow import (
+    Workflow,
+    WorkflowExecution,
+    WorkflowStepResult,
+    WorkflowStatus,
+    WorkflowExecutionStatus,
+    WorkflowStepStatus,
+    WorkflowStepType,
+)
 
 __all__ = [
     "Base",
@@ -129,4 +138,12 @@ __all__ = [
     "TriggerConfig",
     "TriggerType",
     "TriggerStatus",
+    # Workflow 编排（HIA-76 C4）
+    "Workflow",
+    "WorkflowExecution",
+    "WorkflowStepResult",
+    "WorkflowStatus",
+    "WorkflowExecutionStatus",
+    "WorkflowStepStatus",
+    "WorkflowStepType",
 ]

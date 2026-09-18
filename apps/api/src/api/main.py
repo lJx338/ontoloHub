@@ -231,6 +231,11 @@ from src.api.webhooks import router as webhooks_router, trigger_router
 app.include_router(webhooks_router)
 app.include_router(trigger_router)
 
+# HIA-76 C4: Workflow 编排 API
+from src.api.workflow import router as workflow_router, exec_router as workflow_exec_router
+app.include_router(workflow_router)
+app.include_router(workflow_exec_router)
+
 
 @app.get("/api")
 async def api_root() -> dict:
@@ -258,6 +263,8 @@ async def api_root() -> dict:
             "deployments": "/deployments",
             "actions": "/projects/{id}/actions",
             "action_runs": "/projects/{id}/action-runs",
+            "workflows": "/projects/{id}/workflows",
+            "workflow_executions": "/projects/{id}/workflow-executions",
             "users": "/api/users",
             "members": "/projects/{id}/members",
             "audit": "/projects/{id}/audit",

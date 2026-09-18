@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -477,13 +477,26 @@ class TriggerConfigCreate(BaseModel):
     # for schedule: {cron: "*/5 * * * *"}
     # for object_change: {filter: "..."}
     trigger_config: Optional[dict] = None
-    action_type_id: uuid.UUID
+    # Exactly one of action_type_id / workflow_id must be set.
+    # HIA-76 C4: workflows are now first-class trigger targets.
+    action_type_id: Optional[uuid.UUID] = None
+    workflow_id: Optional[uuid.UUID] = None
     input_template: Optional[dict] = Field(
         None,
         description="Template merged with event data to form ActionRun input_data. "
                      "Use {{webhook.payload.xxx}} for inbound webhooks, "
                      "{{schedule.fired_at}} for schedules.",
     )
+
+    @model_validator(mode="after")
+    def _xor_target(self):
+        both_set = self.action_type_id is not None and self.workflow_id is not None
+        neither_set = self.action_type_id is None and self.workflow_id is None
+        if both_set or neither_set:
+            raise ValueError(
+                "必须设置 action_type_id 或 workflow_id 之一（不能同时设置，也不能都不设置）"
+            )
+        return self
 
 
 class TriggerConfigUpdate(BaseModel):
@@ -501,7 +514,9 @@ class TriggerConfigResponse(BaseModel):
     description: Optional[str]
     trigger_type: str
     trigger_config: Optional[dict]
-    action_type_id: uuid.UUID
+    # HIA-76 C4: either action_type_id or workflow_id is set, never both.
+    action_type_id: Optional[uuid.UUID] = None
+    workflow_id: Optional[uuid.UUID] = None
     input_template: Optional[dict]
     status: str
     total_runs: int
@@ -539,16 +554,30 @@ async def create_trigger(
     """
     await require_project_role(project_id, Role.EDITOR, principal=user, session=session)
 
-    # Verify ActionType exists and belongs to project
-    at_result = await session.execute(
-        select(ActionType).where(
-            ActionType.id == data.action_type_id,
-            ActionType.project_id == project_id,
+    # Verify target exists and belongs to project (action_type_id XOR workflow_id).
+    if data.action_type_id is not None:
+        at_result = await session.execute(
+            select(ActionType).where(
+                ActionType.id == data.action_type_id,
+                ActionType.project_id == project_id,
+            )
         )
-    )
-    action_type = at_result.scalar_one_or_none()
-    if not action_type:
-        raise HTTPException(status_code=404, detail="ActionType 不存在")
+        action_type = at_result.scalar_one_or_none()
+        if not action_type:
+            raise HTTPException(status_code=404, detail="ActionType 不存在")
+    else:
+        action_type = None
+        # Lazy import to avoid circular import at module load
+        from src.db.workflow import Workflow as _Workflow
+        wf_result = await session.execute(
+            select(_Workflow).where(
+                _Workflow.id == data.workflow_id,
+                _Workflow.project_id == project_id,
+            )
+        )
+        workflow = wf_result.scalar_one_or_none()
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow 不存在")
 
     # Build trigger_config with auto-generated token for inbound_webhook
     trigger_cfg = (data.trigger_config or {}).copy()
@@ -562,6 +591,7 @@ async def create_trigger(
         trigger_type=TriggerType(data.trigger_type),
         trigger_config=trigger_cfg,
         action_type_id=data.action_type_id,
+        workflow_id=data.workflow_id,
         input_template=data.input_template,
         status=TriggerStatus.ACTIVE,
         created_by=user.user.id if hasattr(user, "user") else None,
@@ -578,6 +608,7 @@ async def create_trigger(
         trigger_type=trigger.trigger_type.value,
         trigger_config=trigger.trigger_config,
         action_type_id=trigger.action_type_id,
+        workflow_id=trigger.workflow_id,
         input_template=trigger.input_template,
         status=trigger.status.value,
         total_runs=trigger.total_runs,
@@ -619,6 +650,7 @@ async def list_triggers(
             trigger_type=t.trigger_type.value,
             trigger_config=t.trigger_config,
             action_type_id=t.action_type_id,
+            workflow_id=t.workflow_id,
             input_template=t.input_template,
             status=t.status.value,
             total_runs=t.total_runs,
@@ -661,6 +693,7 @@ async def get_trigger(
         trigger_type=trigger.trigger_type.value,
         trigger_config=trigger.trigger_config,
         action_type_id=trigger.action_type_id,
+        workflow_id=trigger.workflow_id,
         input_template=trigger.input_template,
         status=trigger.status.value,
         total_runs=trigger.total_runs,
@@ -716,6 +749,7 @@ async def update_trigger(
         trigger_type=trigger.trigger_type.value,
         trigger_config=trigger.trigger_config,
         action_type_id=trigger.action_type_id,
+        workflow_id=trigger.workflow_id,
         input_template=trigger.input_template,
         status=trigger.status.value,
         total_runs=trigger.total_runs,

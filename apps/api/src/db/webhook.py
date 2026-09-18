@@ -220,10 +220,18 @@ class TriggerConfig(Base, UUIDMixin, TimestampMixin, ProjectMixin):
     trigger_config: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     # The ActionType to execute when this trigger fires
-    action_type_id: Mapped[uuid.UUID] = mapped_column(
+    action_type_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("action_types.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
+    )
+
+    # HIA-76 C4: alternatively, a Workflow can be the target of a trigger.
+    # Exactly one of action_type_id / workflow_id is set (enforced at API layer).
+    workflow_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workflows.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
     # Input template: dict merged with trigger event data to form ActionRun.input_data
