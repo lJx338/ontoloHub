@@ -118,6 +118,58 @@ prototype/         # 设计原型，独立维护，不进生产
 - 客户端用 `httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test")`，**不要** 用 `TestClient`（它是同步包装，会和 async fixture 抢 loop）。
 - 用户身份用 `headers={"X-User-Email": ...}`，不要去硬塞 cookie。
 
+**`isolated_app` fixture 标准模板**（见 §6.31 / §6.32）：
+
+```python
+import sys
+from pathlib import Path
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+ROOT = Path(__file__).resolve().parent.parent.parent.parent
+sys.path.insert(0, str(ROOT / "apps" / "api"))
+
+# ⚠️ 切勿在模块级别 import `async_session_factory`：它在 reinit_engines 之前
+# 已绑定到默认 DB 引擎。fixture 必须重新拉取（见下 `isolated_app`）。
+# 模块级先放一个占位 None；helper 函数都通过这个名引用 — 切勿在这里初始化。
+async_session_factory = None  # type: ignore[assignment]
+
+from src.api.<domain> import router  # noqa: E402  路由等无副作用模块可正常导入
+
+
+@pytest_asyncio.fixture
+async def isolated_app(tmp_path, monkeypatch):
+    global async_session_factory
+    db_path = tmp_path / "test.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+
+    from src.core import config as cfg
+    cfg.get_settings.cache_clear()                                # 1. 清 settings 缓存
+
+    from src.db import connection as conn
+    await conn.reinit_engines()                                    # 2. 重建 engine / factory
+    async_session_factory = conn.async_session_factory             # 3. 把全局 rebind 到新 factory
+
+    async with async_session_factory() as s:
+        await ensure_bootstrap_admin(s)
+
+    from src.main import app                                       # noqa: E402  app 在 reinit 之后 import
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        yield client
+
+
+@pytest_asyncio.fixture
+async def auth_headers(isolated_app):
+    # 登录拿 token（开发环境用 bootstrap admin / X-User-Email 即可）
+    return {"X-User-Email": "alice@example.com"}
+```
+
+写入新测试模块时**直接复制这段模板**，再补自己的 router / 业务 fixture；不要
+自己重新拼装三步（cache_clear + reinit + rebind）— 见 §6.31。
+
 ### 4.2 必须覆盖的负例
 
 新加一个端点时，最少要写：
@@ -780,6 +832,77 @@ POST 端点接收合法 JSON 后，跑到 `session.add(bundle); await session.fl
    schema 缺字段。
 4. 自动化 lint（可选）：扫 ORM `nullable=False` 字段，对比同名 schema 类
    是否包含。dev 阶段不做也行，但建议把这一条加进 PR review checklist。
+
+### 6.31 测试文件在模块级 `from src.db.connection import async_session_factory` 会绑定 stale 单例
+
+**症状**：每个 test 函数拿到一个**全新的临时 SQLite DB**，但 helper 函数读
+写操作仍然命中上一次（或默认 PG）的 session；表现是「fixture 看起来生效了，
+但实际写到 `tmp.db` 之外的某个 DB」「跨测试的 isolation 完全没起作用」「某个
+test 改了数据，**下一个 test 看到的却是旧值**」。
+
+**原因**（与 §6.8 / §6.22 不同的另一类陷阱）：
+
+- `src.db.connection.async_session_factory` 是**模块级单例**（构造时绑定
+  `async_engine`，再从 engine 拉 URL）。
+- 测试文件如果顶端写了
+  `from src.db.connection import async_session_factory, reinit_engines`，
+  Python 在 import 时就把这个全局名**绑定到当时指向的那个对象**。
+- fixture 里再 `await conn.reinit_engines()` 会让 `conn.async_session_factory`
+  重新指向新对象，但测试模块顶部那个本地名 `async_session_factory` 还指向旧
+  对象。
+- helper / 测试方法里再用这个局部名 → 操作旧 DB（通常就是 .env 里的 PG 或默认
+  的同进程 sqlite）。fixture 白跑。
+
+**规避**：
+
+- 模块级只放占位：`async_session_factory = None  # type: ignore[assignment]`，
+  fixture 内部 `await conn.reinit_engines()` 之后做
+  `async_session_factory = conn.async_session_factory`（用 `global` 声明）。
+- 或者**完全不引用模块级名**：helper 函数内部都通过
+  `from src.db import connection as conn; ... conn.async_session_factory() ...`
+  这种「每次现场拉」的方式写。
+- 模板见 §4.1 `isolated_app` 标准 fixture；**直接复制**那段代码，不要自己
+  拼 `from src.db.connection import async_session_factory`。
+- 校验：fixture 跑完之后立刻
+  `assert async_session_factory is not None and async_session_factory is conn.async_session_factory`，
+  不一致就立刻报错。
+
+**反例**（不要照着抄）：
+
+```python
+# ❌ import 时绑定，reinit 之后这个名还指向旧对象
+from src.db.connection import async_session_factory, reinit_engines
+
+@pytest_asyncio.fixture
+async def isolated_app(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path/'t.db'}")
+    from src.core import config as cfg; cfg.get_settings.cache_clear()
+    await reinit_engines()
+    # 此时 conn.async_session_factory 已切到 tmp.db，
+    # 但本模块的 async_session_factory 局部名仍指向旧对象 → bug
+```
+
+### 6.32 编辑工具误删 `<Task X>` 行而没补全
+
+**症状**：`docs/MILESTONES.md` / `docs/DEVELOPMENT.md` 的章节列表里突然少了一节，
+例如 §6 突然从 §6.29 跳到 §6.31（其实中间 §6.30 还活着，只是被吞掉了）；或
+者某个 PR 的标题里 `[Task X]` 前缀消失、CI 没拦截，merge 后追溯不到对应卡。
+
+**原因**：在文件里做精细改动时，编辑工具（IDE / 脚本 / 手工 patch）按行号
+匹配上下文；若 anchor 行恰好紧贴 `<Task XXX>` 或 `<section Y>` 这类「意图」
+行（例如「新增 §6.31」后面那行就是 `<Task XXX>`），diff 一晃容易把上一行
+一并删掉。Python / Markdown 的纯文本编辑不像 word 那样有「撤销整段」概念，
+工具可能直接落盘成「§6.30 + §6.32」中间一节被吞。
+
+**规避**：
+
+- 改文件前先 `git diff` 一次 baseline，看清原 anchor 上下文；改完再 diff 一
+  次，发现吞行立刻 revert + 重做。
+- 一次只改一个最小单元：新增 §X.Y 单独一 commit，单独一个 diff 块；不要把
+  「新增 §6.31 + 修改 §4.1 + 新增 §6.32」塞进同一个 patch。
+- §6 / §MILESTONES 这种线性编号文档，新增条目时**手抄上一条 + 下一条的标题
+  作为锚点**（双 anchor），避免编辑工具按"上一条内容"删半截。
+- CI 不强制编号连续；偶尔跳号没事，发现了再补一行说明。
 
 ---
 
