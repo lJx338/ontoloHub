@@ -904,6 +904,102 @@ async def isolated_app(tmp_path, monkeypatch):
   作为锚点**（双 anchor），避免编辑工具按"上一条内容"删半截。
 - CI 不强制编号连续；偶尔跳号没事，发现了再补一行说明。
 
+### 6.33 E2E 走通测试中发现的 API 契约偏差（HIA-66）
+
+E2E demo 测试（`tests/test_e2e_demo.py`）完整跑一遍产品主链路，发现了
+多个「schema 定义 ↔ 实际 API 行为」不匹配的问题，都是单元测试没覆盖到的。
+
+#### 6.33.1 `POST /releases/{id}/preflight` body 必须传 `environment` 字段
+
+**症状**：测试里直接 `POST /releases/releases/{id}/preflight` 不带 body，返回
+`422 {"detail":"Field required"}`。
+
+**原因**：`PreflightRunRequest` 定义了 `environment: str = Field(...)`，
+FastAPI 要求 body 里有这个字段（没有默认值）。
+
+**规避**：调 preflight 端点时，带 `json={"environment": "local"}`
+（或其他环境）作为 body；未来如果要支持无 body 调用，
+`environment` 需改成 `Optional[str] = Field(default="production")`。
+
+#### 6.33.2 `POST /releases/projects/{id}/deployments` — 不是 `/deployments/releases/{id}/deploy`
+
+**症状**：调用 `/deployments/releases/{release_id}/deploy` 返回 404。
+
+**原因**：部署路由是 `POST /projects/{project_id}/deployments`（在 release.py 里），
+request body 是 `DeploymentCreate`，包含 `release_id`、`environment` 等字段。
+
+**规避**：部署调用方式：
+```python
+r = await client.post(
+    f"/releases/projects/{project_id}/deployments",   # 注意：是 projects/{project_id}/deployments
+    json={"release_id": release_id, "environment": "local"},
+)
+```
+
+#### 6.33.3 `POST /objects/projects/{id}/objects` — `object_type` 必须是 enum 值，`name` 必填
+
+**症状**：传 `object_type: "Customer"`（自由字符串）和空 body 返回 422。
+
+**原因**：`ObjectCreate.object_type` 是 `ObjectType` 枚举，合法值只有
+`entity | event | activity | agent | place | document | other`；且 `name` 字段是必填的。
+
+**规避**：创建对象时：
+```python
+r = await client.post(
+    f"/objects/projects/{project_id}/objects",
+    json={
+        "object_type": "entity",   # 枚举值，不是自由字符串
+        "name": "Alice Chen",      # name 必填
+        "data": {"email": "alice@acme.test"},
+    },
+)
+```
+
+#### 6.33.4 `POST /validation/runs` — `project_id` 是 Query 参数，body 用 `target_type`/`target_id` 结构
+
+**症状**：用 `POST /validation/projects/{id}/runs`（path）返回 404；
+用 `POST /validation/runs` 传 `validation_type` 但模型字段不匹配抛 AttributeError。
+
+**原因**：验证运行创建端点的 `project_id` 是 Query 参数，不是路径参数；
+且 `ValidationRun` 模型用 `target_type`/`target_id`/`name` 字段，
+`ValidationRunCreate` 的字段名和模型字段名有映射关系。
+
+**规避**：创建验证运行的正确方式：
+```python
+r = await client.post(
+    "/validation/runs",
+    params={"project_id": project_id},    # Query 参数，不是 path
+    json={
+        "validation_type": "shacl",      # → 映射到 ValidationRun.name
+        "ontology_version_id": v2_id,    # → 映射到 target_type="ontology" + target_id
+        # 或 mapping_version_id 用于 mapping 类型
+    },
+)
+```
+
+#### 6.33.5 `execute_validation_run` — `ValidationStatus` 没有 `SKIPPED` 枚举值
+
+**症状**：`execute_validation_run` 里 `run.status = ValidationStatus.SKIPPED`
+抛 `AttributeError: 'ValidationStatus' has no attribute 'SKIPPED'`。
+
+**原因**：`ValidationStatus` 只有 `PENDING | RUNNING | PASSED | WARNING | FAILED | ERROR`。
+`WARNING` 用来表示"跳过了实际执行"的状态。
+
+**规避**：不要用 `SKIPPED`；用 `WARNING` 替代。
+
+#### 6.33.6 写 E2E 测试时：先走通，再打磨
+
+**经验**：写 E2E 测试的过程中发现了 4 个 API 契约 bug
+（见 §6.33.1–6.33.5），这些问题在单元测试里没有覆盖，
+因为单元测试用的是 mock/in-memory 数据，绕过了真实的 API 路由解析和 schema 校验。
+
+**教训**：
+1. **每个新端点**写一个走 ASGI transport 的集成测试（至少调一次完整 HTTP 往返）。
+2. 测试前先看 `ValidationRunCreate` 等 schema 的实际字段定义，不要按「看起来合理」
+   的字段名写请求。
+3. 发现 422 时，把 `r.text` 完整打印出来；FastAPI 的 `detail` 字段会准确告诉
+   你缺了什么字段和类型不匹配的原因。
+
 ---
 
 ## 7. 工具链 / 环境陷阱
