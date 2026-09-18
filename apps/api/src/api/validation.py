@@ -540,6 +540,196 @@ def _compare_outputs(expected: dict, actual: dict) -> bool:
 
 
 # =====================================================================
+# 验证运行详情 / 保存为查询（HIA-58 / A9 收尾补全）
+# =====================================================================
+
+
+class ValidationRunDetailResponse(BaseModel):
+    """单次验证运行详情（含 violations / summary）。
+
+    与 ``ValidationRunResponse`` 的差异：暴露 ``violations`` 和
+    ``report_summary`` JSON 字段，供前端 verification 页面展示 violation
+    表格（HIA-58 spec：返回运行详情 + 结果）。
+    """
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    name: str
+    description: Optional[str]
+    validation_type: str
+    status: ValidationStatus
+    total_checks: int
+    passed_checks: int
+    warning_checks: int
+    failed_checks: int
+    violations: Optional[list[dict]]
+    report_summary: Optional[dict]
+    started_at: Optional[str]
+    completed_at: Optional[str]
+    duration_ms: Optional[int]
+    triggered_by: Optional[str]
+    created_by: Optional[uuid.UUID]
+    created_at: str
+
+    model_config = {"from_attributes": True}
+
+
+def _run_to_detail(run: ValidationRun) -> ValidationRunDetailResponse:
+    return ValidationRunDetailResponse(
+        id=run.id,
+        project_id=run.project_id,
+        name=run.name or "",
+        description=run.description,
+        validation_type=run.target_type or "",
+        status=run.status,
+        total_checks=run.total_checks or 0,
+        passed_checks=run.passed_checks or 0,
+        warning_checks=run.warning_checks or 0,
+        failed_checks=run.failed_checks or 0,
+        violations=run.violations,
+        report_summary=run.report_summary,
+        started_at=_to_iso(run.started_at),
+        completed_at=_to_iso(run.completed_at),
+        duration_ms=run.duration_ms,
+        triggered_by=run.triggered_by,
+        created_by=run.created_by,
+        created_at=_to_iso(run.created_at),
+    )
+
+
+@router.get("/runs/{run_id}", response_model=ValidationRunDetailResponse)
+async def get_validation_run(
+    run_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+) -> ValidationRunDetailResponse:
+    """获取验证运行详情。
+
+    HIA-58 spec: ``GET /api/projects/{id}/verify/runs/{run_id}``
+    返回运行详情 + 结果（含 violations 数组）。
+    """
+    result = await session.execute(
+        select(ValidationRun).where(ValidationRun.id == run_id)
+    )
+    run = result.scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="验证运行不存在")
+
+    return _run_to_detail(run)
+
+
+class SaveRunAsQueryRequest(BaseModel):
+    """把验证运行保存为可复用查询的请求体"""
+
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = None
+    use_case: Optional[str] = Field(None, max_length=100)
+
+
+class SavedQueryMinimalResponse(BaseModel):
+    """极简 SavedQuery 响应 — 仅暴露模型实际存在的字段。
+
+    SavedQuery 模型（``src/db/validation.py``）只有基础字段：name /
+    description / query / parameters_schema / is_shared / run_count /
+    last_run_at / created_by。已存在的 ``SavedQueryResponse`` schema
+    引用了 model 上不存在的字段（query_type / use_case / is_demo /
+    is_active / result_count）— 那是先存的 bug。本响应避免踩这个坑。
+    """
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    name: str
+    description: Optional[str]
+    is_shared: bool
+    run_count: int
+    last_run_at: Optional[str]
+    created_by: Optional[uuid.UUID]
+    created_at: str
+    updated_at: str
+
+    model_config = {"from_attributes": True}
+
+
+@router.post(
+    "/runs/{run_id}/save-as-query",
+    response_model=SavedQueryMinimalResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def save_validation_run_as_query(
+    run_id: uuid.UUID,
+    data: SaveRunAsQueryRequest,
+    session: AsyncSession = Depends(get_session),
+) -> SavedQueryMinimalResponse:
+    """把成功的验证运行保存为可复用查询（HIA-58 spec）。
+
+    行为：
+    1. 校验 run 存在且状态是 PASSED（失败的运行不应保存为查询模板）
+    2. 序列化 ``query_definition`` 到 SavedQuery 的 ``query`` 字段（Text），
+       ``parameters_schema`` 存 use_case + metadata
+    3. 创建 SavedQuery 行并返回
+
+    前端 verification 页面（HIA-68 / A16）会调用这个端点把成功的校验
+    保存为查询模板，后续可重复跑。
+
+    注意：本端点使用 ``SavedQueryMinimalResponse`` 而非现有
+    ``SavedQueryResponse``，因为后者引用了 model 上不存在的字段
+    （query_type / is_demo / is_active / result_count）。修复 model 与
+    schema 的不一致另起一个 task。
+    """
+    result = await session.execute(
+        select(ValidationRun).where(ValidationRun.id == run_id)
+    )
+    run = result.scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="验证运行不存在")
+
+    if run.status != ValidationStatus.PASSED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"仅 PASSED 的验证运行可保存为查询（当前状态: {run.status.value}）",
+        )
+
+    query_definition = {
+        "source_run_id": str(run.id),
+        "validation_type": run.target_type,
+        "target_id": str(run.target_id),
+        "fixture_ids": run.fixture_ids or [],
+        "shape_paths": run.shape_paths or [],
+        "summary": run.report_summary or {},
+        "use_case": data.use_case,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    import json as _json
+
+    query_obj = SavedQuery(
+        project_id=run.project_id,
+        name=data.name,
+        description=data.description,
+        query=_json.dumps(query_definition, ensure_ascii=False),
+        parameters_schema={
+            "validation_type": run.target_type,
+            "target_id": str(run.target_id),
+        },
+    )
+    session.add(query_obj)
+    await session.flush()
+    await session.refresh(query_obj)
+
+    return SavedQueryMinimalResponse(
+        id=query_obj.id,
+        project_id=query_obj.project_id,
+        name=query_obj.name,
+        description=query_obj.description,
+        is_shared=query_obj.is_shared,
+        run_count=query_obj.run_count or 0,
+        last_run_at=_to_iso(query_obj.last_run_at),
+        created_by=query_obj.created_by,
+        created_at=_to_iso(query_obj.created_at),
+        updated_at=_to_iso(query_obj.updated_at),
+    )
+
+
+# =====================================================================
 # SHACL 校验路由（HIA-73）
 # =====================================================================
 
