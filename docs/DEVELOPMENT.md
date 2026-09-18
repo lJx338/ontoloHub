@@ -666,6 +666,121 @@ schema_info = {"table": body.table, "connector_id": str(conn.id)}
 先加密再写 `connection_info`；但更干净的做法是**不存**，靠 `connector_id` +
 `connector.secret_fields` 的加密链路管理凭据。
 
+### 6.28 SQLAlchemy JSON 字段 in-place 修改在 SQLite 上不会被检测（HIA-61）
+
+**症状**：
+
+```python
+# 错误写法：看起来对，跑测试也有 commit，但 artifacts['tags'] 永远是 []
+if field == "tags":
+    if release.artifacts is None:
+        release.artifacts = {}
+    release.artifacts["tags"] = value  # ← 这一行 SQLAlchemy 没看到变更
+await session.flush()
+await session.refresh(release)
+```
+
+PATCH 返回的 `artifacts.tags` 是 `[]`，不是新写入的 `["updated"]`。
+
+**原因**：SQLAlchemy 默认不"深度监听" JSON 列。`Mapped[dict] = mapped_column(JSON)`
+没有用 `MutableDict.as_mutable(JSON)` 包装，所以 `dict["key"] = value` 这种
+in-place 改动**不会触发 ORM 的 dirty 检查**；只有 `release.artifacts = new_dict`
+这种属性重新赋值才会被检测。
+
+SQLite + aiosqlite 表现更明显：commit/flush 不会报"未保存的修改"，但实际写入
+的是 `{}`（in-place 之前的快照），然后 `session.refresh()` 再覆盖回来，最终
+什么也没存。
+
+**规避**：JSON 字段**任何修改都必须整体赋值**：
+
+```python
+# ✅ 正确：合并 + 整体赋值
+if field == "tags":
+    current = release.artifacts or {}
+    release.artifacts = {**current, "tags": value}
+```
+
+或者用 SQLAlchemy 提供的 `MutableDict.as_mutable(JSON)` 在模型层注册监听，但
+这是全局改造，所有现存 JSON 字段都要审一遍；不推荐中途切换。
+
+**检验方式**：跑一个 `test_update_release` 之类的 happy-path，写 JSON 字段后
+再 `await session.refresh(obj)`，断言字段值已变更。如果仍是旧值，立刻怀疑
+in-place 修改。
+
+### 6.29 `selectinload(SomeModel.missing_relationship)` 不会编译失败（HIA-61）
+
+**症状**：
+
+```python
+query = select(Deployment).options(selectinload(Deployment.release))
+```
+
+启动时 `import` 不报错，`pytest` 跑起来也不报 `KeyError`，但**第一次请求命中
+这个查询**就抛：
+
+```
+AttributeError: type object 'Deployment' has no attribute 'release'.
+Did you mean: 'release_id'?
+```
+
+**原因**：SQLAlchemy 的 `selectinload(SomeModel.relationship)` 是字符串式访问
+类属性，只有在**实际构造查询**（即请求第一次进来）时才解析 relationship 名。
+如果是 relationship 名根本不存在，Python 是解释型访问，直接抛 AttributeError
+而不是导入期错误。
+
+**规避**：
+1. 写端点前**先确认 ORM 模型上的 relationship 名**；只有显式声明
+   `relationship("Release", back_populates="...")` 才有 `Deployment.release`。
+2. 没有 relationship 但要 join 用 `select(...).join(Release).where(...)` 就够了，
+   **不需要 `options(selectinload(...))`**。
+3. 写完端点后**真实启动 + curl 一次**触发懒加载路径，仅靠单元测试查不到
+   （如果 selectinload 永远走不到、或者测试覆盖不全）。
+4. 旧项目里如果发现历史代码写了 `selectinload(Model.x)` 但 `Model.x` 不存在，
+   用 grep 一次性清理：
+
+```bash
+rg "selectinload\(([A-Z][A-Za-z]+)\.([a-z_]+)\)" -or '$1.$2' | sort -u
+```
+
+然后逐个去模型里核对。
+
+### 6.30 数据库 NOT NULL 字段必须出现在 Pydantic Create schema（HIA-61）
+
+**症状**：
+
+```python
+class UseCaseBundleCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    version: str
+    # 漏了 release_id
+
+class UseCaseBundle(Base):
+    # ORM 模型
+    release_id: Mapped[uuid.UUID] = mapped_column(UUID, ForeignKey(...), nullable=False)
+```
+
+POST 端点接收合法 JSON 后，跑到 `session.add(bundle); await session.flush()` 时
+才抛 `IntegrityError: NOT NULL constraint failed: use_case_bundles.release_id`。
+开发体验差，且容易在生产触发 500。
+
+**原因**：Pydantic schema 没有对应字段 → `data.release_id` 是 `None` → ORM
+构造时收到 None → DB 拒绝写入。模型和 schema 是两套独立的"接口契约"，缺一
+就崩。
+
+**规避**：
+1. 任何 `nullable=False` 的 ORM 字段，**对应的 *Create schema 字段必填，
+   *Update schema 字段可选**。
+2. 端点处理函数**第一行**就校验外键存在：
+   ```python
+   if data.release_id:
+       await _verify_release_exists(session, data.release_id)
+   ```
+3. 加集成测试覆盖"完整正常 body"的 happy-path；只测异常 case 测不出
+   schema 缺字段。
+4. 自动化 lint（可选）：扫 ORM `nullable=False` 字段，对比同名 schema 类
+   是否包含。dev 阶段不做也行，但建议把这一条加进 PR review checklist。
+
 ---
 
 ## 7. 工具链 / 环境陷阱
@@ -1430,3 +1545,88 @@ fixture 模板见 `tests/test_auth_jwt.py::client` — 独立 SQLite + alembic
 upgrade head + bootstrap admin + `ASGITransport`，**不要**复用
 `test_auth_isolation_audit.py` 的 `isolated_app`（它假设 header-based
 认证，JWT 测试需要给 admin 设密码）。
+
+---
+
+## 16. Release + Deployment + Preflight（HIA-61 / A11）
+
+### 16.1 模块边界
+
+- `apps/api/src/api/release.py` — 所有端点 + Pydantic schema
+- `apps/api/src/db/release.py` — `Release` / `Deployment` / `UseCaseBundle` / `PreflightReport` ORM 模型
+- **路由前缀统一 `/releases`**，子路由：
+  - `/releases/projects/{project_id}/releases` — Release 列表/创建
+  - `/releases/releases/{release_id}` — Release 详情/更新
+  - `/releases/releases/{release_id}/download` — manifest 下载
+  - `/releases/releases/{release_id}/preflight` — 预检
+  - `/releases/releases/{release_id}/publish` — 发布
+  - `/releases/projects/{project_id}/deployments` — Deployment 列表/创建
+  - `/releases/deployments/{deployment_id}` — Deployment 详情/更新/回滚
+  - `/releases/projects/{project_id}/use-case-bundles` — UseCaseBundle CRUD
+  - `/releases/projects/{project_id}/preflight-reports` — PreflightReport 列表
+
+### 16.2 Release 状态机
+
+```
+DRAFT ──publish──► BUILT ──(内部)──► RELEASED
+                       │
+                       ├──preflight──► PREFLIGHTING ──► PREFLIGHT_FAILED
+                       │                       │
+                       │                       └─► PASSED
+                       └──deploy──► DEPLOYING ──► DEPLOYED / FAILED
+```
+
+- `DRAFT` 是新建时的初始状态；`BUILT` 由 `publish` 端点写入；
+  `RELEASED` 在 BUILT 后所有校验通过时写入。
+- 已 `RELEASED`/`PUBLISHED` 的 release **不可修改 description / tags**（PATCH 返回 400）。
+- Deployment 只接受 `RELEASED` 状态的 release；`DRAFT` / `BUILT` → 400。
+
+### 16.3 tags 字段的特殊处理
+
+- `Release.tags` **不存数据库列**，统一写到 `artifacts["tags"]`。
+- PATCH 时：
+  ```python
+  current = release.artifacts or {}
+  release.artifacts = {**current, "tags": value}
+  ```
+  必须**整体赋值**（见 §6.28 — SQLAlchemy JSON in-place 不被检测）。
+- 不要把 `tags` 当成 ORM 字段加到模型上 — 它会破坏 manifest 反序列化逻辑。
+
+### 16.4 Deployment 模型没有 `release` relationship
+
+- `Deployment` 只有 `release_id` 外键列，**没有**显式 `relationship("Release")`。
+- 任何 `selectinload(Deployment.release)` 都会 AttributeError（见 §6.29）。
+- 列出 deployment 时直接 `.join(Release).where(Release.project_id == ...)`
+  就够了；不需要预加载。
+
+### 16.5 UseCaseBundle 必须带 release_id
+
+- `UseCaseBundle.release_id` 在 DB 里是 NOT NULL + ForeignKey。
+- Create schema `UseCaseBundleCreate` 必填 `release_id: uuid.UUID`。
+- 创建端点必须先 `_verify_release_exists` 再校验 `release.project_id == project_id`
+  （跨项目 bundle → 400）。
+
+### 16.6 Preflight 当前是 placeholder
+
+- `release/{rid}/preflight` 返回 4 项 hardcoded check：
+  ontology_version / mapping_version / database_connectivity / artifact_integrity，
+  后两个永远 pass。
+- 这是占位实现，等 HIA-58 (SHACL 校验执行) 完成后接入真实检查。
+- 客户端调用按这个 shape 解析；改字段前通知 web 前端。
+
+### 16.7 集成测试
+
+- `tests/test_release_deployment.py` — 17 个测试覆盖 CRUD / preflight / deploy /
+  cross-project isolation / 入参校验。每个测试独立 SQLite + alembic up head。
+- 写新端点前先看这个文件的 fixture 模板；保持 `isolated_app` → `client` 二级
+  fixture 结构。
+
+### 16.8 避坑速查
+
+| 症状 | 原因 | 修法 |
+|---|---|---|
+| PATCH tags 后还是空 | SQLAlchemy 检测不到 in-place JSON 改动（§6.28） | 整体赋值 `{**current, "tags": value}` |
+| list deployments 500 AttributeError | `Deployment` 没 `release` 关系（§6.29） | 删 `selectinload(Deployment.release)`，只用 `.join()` |
+| 创建 use-case-bundle NOT NULL 失败 | schema 缺 `release_id`（§6.30） | 加 `release_id: uuid.UUID` 必填 |
+| 发布后 PATCH 400 | release.status 已是 RELEASED | 用 PUT 走 update，或先 unpublish |
+
