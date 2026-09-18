@@ -1921,3 +1921,711 @@ async def get_version(
         relation_count=len(v.relation_snapshot) if v.relation_snapshot else 0,
         constraint_count=len(v.constraint_snapshot) if v.constraint_snapshot else 0,
     )
+
+
+# =====================================================================
+# Fork（分支）— HIA-56 / A7 缺失端点
+# =====================================================================
+
+
+class ForkRequest(BaseModel):
+    """Fork 请求"""
+
+    name: str = Field(..., min_length=1, max_length=255)
+    namespace: str = Field(..., min_length=1, max_length=500)
+    description: Optional[str] = Field(None, max_length=1000)
+    version_tag: str = Field(default="fork-1", max_length=50)
+
+
+class ForkResponse(BaseModel):
+    """Fork 响应"""
+
+    forked_ontology_id: uuid.UUID
+    forked_ontology_name: str
+    forked_namespace: str
+    forked_version_id: uuid.UUID
+    forked_version: str
+    parent_ontology_id: uuid.UUID
+    parent_version: Optional[str]
+    class_count: int
+    property_count: int
+
+
+def _fork_iri(old_iri: str, old_namespace: str, new_namespace: str) -> str:
+    """把旧 IRI 中的 old_namespace 替换为 new_namespace。"""
+    if old_iri.startswith(old_namespace):
+        return new_namespace.rstrip("/#") + "/" + old_iri[len(old_namespace):].lstrip("/#")
+    # 尝试用 rsplit
+    if "/" in old_iri or "#" in old_iri:
+        sep = "#" if "#" in old_iri else "/"
+        return new_namespace.rstrip("/#") + sep + old_iri.split(sep)[-1]
+    return old_iri
+
+
+@router.post("/{ontology_id}/fork", response_model=ForkResponse, status_code=status.HTTP_201_CREATED)
+async def fork_ontology(
+    ontology_id: uuid.UUID,
+    data: ForkRequest,
+    session: AsyncSession = Depends(get_session),
+) -> ForkResponse:
+    """Fork 本体
+
+    从当前本体复制一个完整副本：
+    - 创建新的 Ontology（draft 状态）
+    - 复制所有 OntologyClass / Property / Relation / Constraint（IRI 按新 namespace 重写）
+    - 创建首个 OntologyVersion 快照（status=draft）
+    - 返回新本体信息
+
+    用于实验性分支、基于参考本体派生等场景。
+    """
+    # 1. 找到源本体
+    src_result = await session.execute(
+        select(Ontology).where(Ontology.id == ontology_id)
+    )
+    src = src_result.scalar_one_or_none()
+    if not src:
+        raise HTTPException(status_code=404, detail="源本体不存在")
+
+    # 2. 创建新的 Ontology
+    forked = Ontology(
+        name=data.name,
+        namespace=data.namespace,
+        description=data.description or src.description,
+        project_id=src.project_id,
+        kind=src.kind,
+        status=OntologyStatus.DRAFT,
+        standard_name=src.standard_name,
+        source_url=src.source_url,
+        source_format=src.source_format,
+        version=data.version_tag,
+        class_count=src.class_count,
+        property_count=src.property_count,
+        created_by=getattr(src, "created_by", None),
+    )
+    session.add(forked)
+    await session.flush()
+    await session.refresh(forked)
+
+    old_ns = src.namespace
+
+    # 3. 复制类
+    src_classes = list((await session.execute(
+        select(OntologyClass).where(OntologyClass.ontology_id == ontology_id)
+    )).scalars().all())
+
+    old_iri_to_new: dict[str, str] = {}
+    for c in src_classes:
+        new_iri = _fork_iri(c.iri, old_ns, data.namespace)
+        old_iri_to_new[c.iri] = new_iri
+
+        new_class = OntologyClass(
+            ontology_id=forked.id,
+            name=c.name,
+            local_name=c.local_name,
+            iri=new_iri,
+            class_type=c.class_type,
+            parent_iri=c.parent_iri,
+            level=c.level,
+            description=c.description,
+            definition=c.definition,
+            examples=c.examples,
+            enum_values=c.enum_values,
+            alignment=c.alignment,
+            standard_mappings=c.standard_mappings,
+            created_by=c.created_by,
+        )
+        session.add(new_class)
+
+    await session.flush()
+
+    # 4. 复制属性
+    src_props = list((await session.execute(
+        select(Property).where(Property.ontology_id == ontology_id)
+    )).scalars().all())
+
+    for p in src_props:
+        new_iri = _fork_iri(p.iri, old_ns, data.namespace)
+        # 映射 domain_iri / range_class_iri
+        new_domain_iri = _fork_iri(p.domain_iri, old_ns, data.namespace) if p.domain_iri else None
+        new_range_iri = _fork_iri(p.range_class_iri, old_ns, data.namespace) if p.range_class_iri else None
+
+        new_prop = Property(
+            ontology_id=forked.id,
+            name=p.name,
+            local_name=p.local_name,
+            iri=new_iri,
+            property_type=p.property_type,
+            domain_iri=new_domain_iri,
+            range_type=p.range_type,
+            range_class_iri=new_range_iri,
+            description=p.description,
+            unit=p.unit,
+            is_required=p.is_required,
+            is_multivalued=p.is_multivalued,
+            standard_mappings=p.standard_mappings,
+            created_by=p.created_by,
+        )
+        session.add(new_prop)
+
+    # 5. 复制关系
+    src_rels = list((await session.execute(
+        select(Relation).where(Relation.ontology_id == ontology_id)
+    )).scalars().all())
+
+    for r in src_rels:
+        new_iri = _fork_iri(r.iri, old_ns, data.namespace)
+        new_src_iri = _fork_iri(r.source_class_iri, old_ns, data.namespace) if r.source_class_iri else None
+        new_tgt_iri = _fork_iri(r.target_class_iri, old_ns, data.namespace) if r.target_class_iri else None
+
+        new_rel = Relation(
+            ontology_id=forked.id,
+            name=r.name,
+            local_name=r.local_name,
+            iri=new_iri,
+            relation_type=r.relation_type,
+            source_class_iri=new_src_iri,
+            target_class_iri=new_tgt_iri,
+            is_required=r.is_required,
+            is_transitive=r.is_transitive,
+            is_symmetric=r.is_symmetric,
+            is_inverse_functional=r.is_inverse_functional,
+            description=r.description,
+            created_by=r.created_by,
+        )
+        session.add(new_rel)
+
+    # 6. 复制约束
+    src_cons = list((await session.execute(
+        select(Constraint).where(Constraint.ontology_id == ontology_id)
+    )).scalars().all())
+
+    for c in src_cons:
+        new_target = _fork_iri(c.target_class_iri, old_ns, data.namespace) if c.target_class_iri else None
+        new_prop_iri = _fork_iri(c.property_iri, old_ns, data.namespace) if c.property_iri else None
+
+        new_con = Constraint(
+            ontology_id=forked.id,
+            name=c.name,
+            ontology_class_id=None,  # 新类 ID 需要查表，重新关联
+            property_id=None,
+            target_class_iri=new_target,
+            property_iri=new_prop_iri,
+            constraint_type=c.constraint_type,
+            severity=c.severity,
+            value=c.value,
+            description=c.description,
+        )
+        session.add(new_con)
+
+    # 7. 创建 fork 版本快照
+    fork_version = OntologyVersion(
+        ontology_id=forked.id,
+        version=data.version_tag,
+        status=OntologyVersionStatus.DRAFT,
+        is_baseline=False,
+        baseline_of=ontology_id,
+        change_summary=f"Forked from {src.name} (v{src.version or 'N/A'})",
+        class_snapshot=[_serialize_class_for_version(c) for c in src_classes] if src_classes else None,
+        property_snapshot=[_serialize_property_for_version(p) for p in src_props] if src_props else None,
+        relation_snapshot=[_serialize_relation_for_version(r) for r in src_rels] if src_rels else None,
+        constraint_snapshot=[_serialize_constraint_for_version(c) for c in src_cons] if src_cons else None,
+    )
+    session.add(fork_version)
+
+    await session.flush()
+    await session.refresh(fork_version)
+
+    return ForkResponse(
+        forked_ontology_id=forked.id,
+        forked_ontology_name=forked.name,
+        forked_namespace=forked.namespace,
+        forked_version_id=fork_version.id,
+        forked_version=fork_version.version,
+        parent_ontology_id=ontology_id,
+        parent_version=src.version,
+        class_count=len(src_classes),
+        property_count=len(src_props),
+    )
+
+
+# =====================================================================
+# Diff（版本对比）— HIA-56 / A7 缺失端点
+# =====================================================================
+
+
+class DiffClassEntry(BaseModel):
+    iri: str
+    name: str
+    change: str  # added | removed | unchanged | modified
+
+
+class DiffPropertyEntry(BaseModel):
+    iri: str
+    name: str
+    domain_iri: Optional[str]
+    change: str
+
+
+class DiffRelationEntry(BaseModel):
+    iri: str
+    name: str
+    source_class_iri: Optional[str]
+    target_class_iri: Optional[str]
+    change: str
+
+
+class DiffConstraintEntry(BaseModel):
+    iri: Optional[str]
+    target_class_iri: Optional[str]
+    property_iri: Optional[str]
+    constraint_type: str
+    change: str
+
+
+class OntologyDiffResponse(BaseModel):
+    from_version_id: uuid.UUID
+    from_version: str
+    to_version_id: uuid.UUID
+    to_version: str
+    class_diff: list[DiffClassEntry]
+    property_diff: list[DiffPropertyEntry]
+    relation_diff: list[DiffRelationEntry]
+    constraint_diff: list[DiffConstraintEntry]
+    summary: dict
+
+
+@router.get("/{ontology_id}/diff", response_model=OntologyDiffResponse)
+async def diff_ontology_versions(
+    ontology_id: uuid.UUID,
+    from_version: str = Query(..., description="源版本标签，如 'v1.0'"),
+    to_version: str = Query(..., description="目标版本标签，如 'v2.0'"),
+    session: AsyncSession = Depends(get_session),
+) -> OntologyDiffResponse:
+    """对比本体两个版本
+
+    行为：
+    - 按 ontology_id 和 version 标签找两个 OntologyVersion
+    - 对比 class_snapshot / property_snapshot / relation_snapshot / constraint_snapshot
+    - 返回每个维度的增/删/改列表 + 汇总统计
+    """
+    from_v_result = await session.execute(
+        select(OntologyVersion).where(
+            and_(
+                OntologyVersion.ontology_id == ontology_id,
+                OntologyVersion.version == from_version,
+            )
+        )
+    )
+    from_v = from_v_result.scalar_one_or_none()
+    if not from_v:
+        raise HTTPException(status_code=404, detail=f"源版本 '{from_version}' 不存在")
+
+    to_v_result = await session.execute(
+        select(OntologyVersion).where(
+            and_(
+                OntologyVersion.ontology_id == ontology_id,
+                OntologyVersion.version == to_version,
+            )
+        )
+    )
+    to_v = to_v_result.scalar_one_or_none()
+    if not to_v:
+        raise HTTPException(status_code=404, detail=f"目标版本 '{to_version}' 不存在")
+
+    # ---- 类对比 ----
+    from_classes = {c["iri"]: c for c in (from_v.class_snapshot or [])}
+    to_classes = {c["iri"]: c for c in (to_v.class_snapshot or [])}
+
+    class_diff: list[DiffClassEntry] = []
+    for iri, c in to_classes.items():
+        if iri not in from_classes:
+            class_diff.append(DiffClassEntry(iri=iri, name=c.get("name", ""), change="added"))
+        else:
+            from_c = from_classes[iri]
+            # 简单修改检测：比对 name / description / definition
+            if c.get("name") != from_c.get("name") or c.get("description") != from_c.get("description"):
+                class_diff.append(DiffClassEntry(iri=iri, name=c.get("name", ""), change="modified"))
+            else:
+                class_diff.append(DiffClassEntry(iri=iri, name=c.get("name", ""), change="unchanged"))
+    for iri in from_classes:
+        if iri not in to_classes:
+            class_diff.append(DiffClassEntry(iri=iri, name=from_classes[iri].get("name", ""), change="removed"))
+
+    # ---- 属性对比 ----
+    from_props = {p["iri"]: p for p in (from_v.property_snapshot or [])}
+    to_props = {p["iri"]: p for p in (to_v.property_snapshot or [])}
+
+    property_diff: list[DiffPropertyEntry] = []
+    for iri, p in to_props.items():
+        if iri not in from_props:
+            property_diff.append(DiffPropertyEntry(iri=iri, name=p.get("name", ""), domain_iri=p.get("domain_iri"), change="added"))
+        else:
+            from_p = from_props[iri]
+            if p != from_p:
+                property_diff.append(DiffPropertyEntry(iri=iri, name=p.get("name", ""), domain_iri=p.get("domain_iri"), change="modified"))
+            else:
+                property_diff.append(DiffPropertyEntry(iri=iri, name=p.get("name", ""), domain_iri=p.get("domain_iri"), change="unchanged"))
+    for iri in from_props:
+        if iri not in to_props:
+            property_diff.append(DiffPropertyEntry(iri=iri, name=from_props[iri].get("name", ""), domain_iri=from_props[iri].get("domain_iri"), change="removed"))
+
+    # ---- 关系对比 ----
+    from_rels = {r["iri"]: r for r in (from_v.relation_snapshot or [])}
+    to_rels = {r["iri"]: r for r in (to_v.relation_snapshot or [])}
+
+    relation_diff: list[DiffRelationEntry] = []
+    for iri, r in to_rels.items():
+        if iri not in from_rels:
+            relation_diff.append(DiffRelationEntry(iri=iri, name=r.get("name", ""), source_class_iri=r.get("source_class_iri"), target_class_iri=r.get("target_class_iri"), change="added"))
+        else:
+            from_r = from_rels[iri]
+            if r != from_r:
+                relation_diff.append(DiffRelationEntry(iri=iri, name=r.get("name", ""), source_class_iri=r.get("source_class_iri"), target_class_iri=r.get("target_class_iri"), change="modified"))
+            else:
+                relation_diff.append(DiffRelationEntry(iri=iri, name=r.get("name", ""), source_class_iri=r.get("source_class_iri"), target_class_iri=r.get("target_class_iri"), change="unchanged"))
+    for iri in from_rels:
+        if iri not in to_rels:
+            relation_diff.append(DiffRelationEntry(iri=iri, name=from_rels[iri].get("name", ""), source_class_iri=from_rels[iri].get("source_class_iri"), target_class_iri=from_rels[iri].get("target_class_iri"), change="removed"))
+
+    # ---- 约束对比 ----
+    from_cons = {(c.get("target_class_iri") or "", c.get("property_iri") or "", c.get("constraint_type") or ""): c for c in (from_v.constraint_snapshot or [])}
+    to_cons = {(c.get("target_class_iri") or "", c.get("property_iri") or "", c.get("constraint_type") or ""): c for c in (to_v.constraint_snapshot or [])}
+
+    constraint_diff: list[DiffConstraintEntry] = []
+    for key in to_cons:
+        if key not in from_cons:
+            c = to_cons[key]
+            constraint_diff.append(DiffConstraintEntry(iri=None, target_class_iri=c.get("target_class_iri"), property_iri=c.get("property_iri"), constraint_type=c.get("constraint_type", ""), change="added"))
+        else:
+            if to_cons[key] != from_cons[key]:
+                constraint_diff.append(DiffConstraintEntry(iri=None, target_class_iri=to_cons[key].get("target_class_iri"), property_iri=to_cons[key].get("property_iri"), constraint_type=to_cons[key].get("constraint_type", ""), change="modified"))
+            else:
+                constraint_diff.append(DiffConstraintEntry(iri=None, target_class_iri=to_cons[key].get("target_class_iri"), property_iri=to_cons[key].get("property_iri"), constraint_type=to_cons[key].get("constraint_type", ""), change="unchanged"))
+    for key in from_cons:
+        if key not in to_cons:
+            c = from_cons[key]
+            constraint_diff.append(DiffConstraintEntry(iri=None, target_class_iri=c.get("target_class_iri"), property_iri=c.get("property_iri"), constraint_type=c.get("constraint_type", ""), change="removed"))
+
+    summary = {
+        "classes": {
+            "added": sum(1 for e in class_diff if e.change == "added"),
+            "removed": sum(1 for e in class_diff if e.change == "removed"),
+            "modified": sum(1 for e in class_diff if e.change == "modified"),
+            "unchanged": sum(1 for e in class_diff if e.change == "unchanged"),
+        },
+        "properties": {
+            "added": sum(1 for e in property_diff if e.change == "added"),
+            "removed": sum(1 for e in property_diff if e.change == "removed"),
+            "modified": sum(1 for e in property_diff if e.change == "modified"),
+            "unchanged": sum(1 for e in property_diff if e.change == "unchanged"),
+        },
+        "relations": {
+            "added": sum(1 for e in relation_diff if e.change == "added"),
+            "removed": sum(1 for e in relation_diff if e.change == "removed"),
+            "modified": sum(1 for e in relation_diff if e.change == "modified"),
+            "unchanged": sum(1 for e in relation_diff if e.change == "unchanged"),
+        },
+        "constraints": {
+            "added": sum(1 for e in constraint_diff if e.change == "added"),
+            "removed": sum(1 for e in constraint_diff if e.change == "removed"),
+            "modified": sum(1 for e in constraint_diff if e.change == "modified"),
+            "unchanged": sum(1 for e in constraint_diff if e.change == "unchanged"),
+        },
+    }
+
+    return OntologyDiffResponse(
+        from_version_id=from_v.id,
+        from_version=from_v.version,
+        to_version_id=to_v.id,
+        to_version=to_v.version,
+        class_diff=class_diff,
+        property_diff=property_diff,
+        relation_diff=relation_diff,
+        constraint_diff=constraint_diff,
+        summary=summary,
+    )
+
+
+# =====================================================================
+# Version CRUD（HIA-56 / A7）
+# =====================================================================
+
+
+class CreateVersionRequest(BaseModel):
+    """创建草稿版本请求"""
+
+    version: str = Field(
+        default="draft",
+        min_length=1,
+        max_length=50,
+        description="版本标签，如 'draft-1' 或 'v0.2.0'",
+    )
+    change_summary: Optional[str] = Field(
+        None, max_length=1000, description="版本变更说明"
+    )
+
+
+class UpdateVersionContentRequest(BaseModel):
+    """更新版本快照内容（编辑器保存）"""
+
+    class_snapshot: Optional[list[dict]] = None
+    property_snapshot: Optional[list[dict]] = None
+    relation_snapshot: Optional[list[dict]] = None
+    constraint_snapshot: Optional[list[dict]] = None
+    change_summary: Optional[str] = Field(None, max_length=1000)
+
+
+class PublishVersionRequest(BaseModel):
+    """发布版本请求"""
+
+    change_summary: Optional[str] = Field(None, max_length=1000)
+
+
+class VersionDetailResponse(BaseModel):
+    """含快照内容的版本详情"""
+
+    id: uuid.UUID
+    ontology_id: uuid.UUID
+    version: str
+    status: OntologyVersionStatus
+    is_baseline: bool
+    change_summary: Optional[str]
+    published_at: Optional[str]
+    created_at: str
+    updated_at: str
+    class_snapshot: Optional[list] = []
+    property_snapshot: Optional[list] = []
+    relation_snapshot: Optional[list] = []
+    constraint_snapshot: Optional[list] = []
+    class_count: int = 0
+    property_count: int = 0
+    relation_count: int = 0
+    constraint_count: int = 0
+
+    model_config = {"from_attributes": True}
+
+
+@router.post(
+    "/{ontology_id}/versions",
+    response_model=VersionDetailResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_draft_version(
+    ontology_id: uuid.UUID,
+    data: CreateVersionRequest = None,
+    session: AsyncSession = Depends(get_session),
+) -> VersionDetailResponse:
+    """基于当前 head 创建新草稿版本（fork from published head）
+
+    行为：
+    - 找到当前已发布的最新版本作为 parent（若无则创建空快照）
+    - 将其快照内容复制到新的 DRAFT 版本
+    """
+    # 1. 找本体
+    onto_result = await session.execute(
+        select(Ontology).where(Ontology.id == ontology_id)
+    )
+    ontology = onto_result.scalar_one_or_none()
+    if not ontology:
+        raise HTTPException(status_code=404, detail="本体不存在")
+
+    # 2. 找最新发布的版本作为 parent
+    parent_result = await session.execute(
+        select(OntologyVersion)
+        .where(
+            and_(
+                OntologyVersion.ontology_id == ontology_id,
+                OntologyVersion.status == OntologyVersionStatus.PUBLISHED,
+            )
+        )
+        .order_by(OntologyVersion.published_at.desc())
+        .limit(1)
+    )
+    parent = parent_result.scalar_one_or_none()
+
+    # 3. 创建新草稿版本
+    version_tag = (data.version or "draft") if data else "draft"
+
+    new_version = OntologyVersion(
+        ontology_id=ontology_id,
+        version=version_tag,
+        status=OntologyVersionStatus.DRAFT,
+        change_summary=data.change_summary if data else None,
+        # 从 parent 复制快照
+        class_snapshot=(
+            list(parent.class_snapshot) if parent and parent.class_snapshot else []
+        ),
+        property_snapshot=(
+            list(parent.property_snapshot) if parent and parent.property_snapshot else []
+        ),
+        relation_snapshot=(
+            list(parent.relation_snapshot) if parent and parent.relation_snapshot else []
+        ),
+        constraint_snapshot=(
+            list(parent.constraint_snapshot)
+            if parent and parent.constraint_snapshot
+            else []
+        ),
+        baseline_of=parent.id if parent else None,
+    )
+    session.add(new_version)
+    await session.flush()
+    await session.refresh(new_version)
+
+    return VersionDetailResponse(
+        id=new_version.id,
+        ontology_id=new_version.ontology_id,
+        version=new_version.version,
+        status=new_version.status,
+        is_baseline=new_version.is_baseline,
+        change_summary=new_version.change_summary,
+        published_at=_to_iso(new_version.published_at),
+        created_at=_to_iso(new_version.created_at),
+        updated_at=_to_iso(new_version.updated_at),
+        class_snapshot=new_version.class_snapshot or [],
+        property_snapshot=new_version.property_snapshot or [],
+        relation_snapshot=new_version.relation_snapshot or [],
+        constraint_snapshot=new_version.constraint_snapshot or [],
+        class_count=len(new_version.class_snapshot or []),
+        property_count=len(new_version.property_snapshot or []),
+        relation_count=len(new_version.relation_snapshot or []),
+        constraint_count=len(new_version.constraint_snapshot or []),
+    )
+
+
+@router.put(
+    "/{ontology_id}/versions/{version_id}/content",
+    response_model=VersionDetailResponse,
+)
+async def update_version_content(
+    ontology_id: uuid.UUID,
+    version_id: uuid.UUID,
+    data: UpdateVersionContentRequest,
+    session: AsyncSession = Depends(get_session),
+) -> VersionDetailResponse:
+    """更新版本快照内容（编辑器保存）
+
+    行为：
+    - 仅允许更新 DRAFT 状态的版本
+    - 整体替换快照字段
+    """
+    result = await session.execute(
+        select(OntologyVersion).where(
+            and_(
+                OntologyVersion.id == version_id,
+                OntologyVersion.ontology_id == ontology_id,
+            )
+        )
+    )
+    v = result.scalar_one_or_none()
+    if not v:
+        raise HTTPException(status_code=404, detail="版本不存在")
+
+    if v.status != OntologyVersionStatus.DRAFT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"只能修改 DRAFT 状态的版本，当前状态：{v.status.value}",
+        )
+
+    # 整体替换快照
+    if data.class_snapshot is not None:
+        v.class_snapshot = data.class_snapshot
+    if data.property_snapshot is not None:
+        v.property_snapshot = data.property_snapshot
+    if data.relation_snapshot is not None:
+        v.relation_snapshot = data.relation_snapshot
+    if data.constraint_snapshot is not None:
+        v.constraint_snapshot = data.constraint_snapshot
+    if data.change_summary is not None:
+        v.change_summary = data.change_summary
+
+    await session.flush()
+    await session.refresh(v)
+
+    return VersionDetailResponse(
+        id=v.id,
+        ontology_id=v.ontology_id,
+        version=v.version,
+        status=v.status,
+        is_baseline=v.is_baseline,
+        change_summary=v.change_summary,
+        published_at=_to_iso(v.published_at),
+        created_at=_to_iso(v.created_at),
+        updated_at=_to_iso(v.updated_at),
+        class_snapshot=v.class_snapshot or [],
+        property_snapshot=v.property_snapshot or [],
+        relation_snapshot=v.relation_snapshot or [],
+        constraint_snapshot=v.constraint_snapshot or [],
+        class_count=len(v.class_snapshot or []),
+        property_count=len(v.property_snapshot or []),
+        relation_count=len(v.relation_snapshot or []),
+        constraint_count=len(v.constraint_snapshot or []),
+    )
+
+
+@router.post(
+    "/{ontology_id}/versions/{version_id}/publish",
+    response_model=PublishResponse,
+)
+async def publish_version(
+    ontology_id: uuid.UUID,
+    version_id: uuid.UUID,
+    data: PublishVersionRequest = None,
+    session: AsyncSession = Depends(get_session),
+) -> PublishResponse:
+    """将特定版本发布为新的 head
+
+    行为：
+    - 校验版本状态为 DRAFT
+    - 将 version_record 状态置为 PUBLISHED，写入 published_at
+    - 将 ontology.version 更新为该版本标签，ontology.status 置为 PUBLISHED
+    """
+    # 1. 找本体
+    onto_result = await session.execute(
+        select(Ontology).where(Ontology.id == ontology_id)
+    )
+    ontology = onto_result.scalar_one_or_none()
+    if not ontology:
+        raise HTTPException(status_code=404, detail="本体不存在")
+
+    # 2. 找版本
+    result = await session.execute(
+        select(OntologyVersion).where(
+            and_(
+                OntologyVersion.id == version_id,
+                OntologyVersion.ontology_id == ontology_id,
+            )
+        )
+    )
+    v = result.scalar_one_or_none()
+    if not v:
+        raise HTTPException(status_code=404, detail="版本不存在")
+
+    if v.status != OntologyVersionStatus.DRAFT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"只能发布 DRAFT 状态的版本，当前状态：{v.status.value}",
+        )
+
+    # 3. 发布
+    v.status = OntologyVersionStatus.PUBLISHED
+    v.published_at = datetime.now(timezone.utc)
+
+    # 4. 更新本体 head
+    ontology.version = v.version
+    ontology.status = OntologyStatus.PUBLISHED
+    ontology.class_count = len(v.class_snapshot or [])
+    ontology.property_count = len(v.property_snapshot or [])
+
+    await session.flush()
+    await session.refresh(v)
+
+    return PublishResponse(
+        version_id=v.id,
+        version=v.version,
+        snapshot_class_count=len(v.class_snapshot or []),
+        snapshot_property_count=len(v.property_snapshot or []),
+        snapshot_relation_count=len(v.relation_snapshot or []),
+        snapshot_constraint_count=len(v.constraint_snapshot or []),
+        published_at=v.published_at.isoformat() if v.published_at else "",
+    )

@@ -51,7 +51,7 @@ services:
 
   api:
     build:
-      context: .
+      context: apps/api          # HIA-64 B1：api 子包内 Dockerfile
       dockerfile: Dockerfile
     container_name: ontolohub-api
     restart: unless-stopped
@@ -70,13 +70,15 @@ services:
       API_DEBUG: "false"
       LOG_LEVEL: INFO
       LOG_FORMAT: text
+      # JWT secret：生产环境必须显式设（不能用派生 secret）
+      SECRET_KEY: "change-me-in-production-use-stable-random-here"
+      JWT_SECRET: "change-me-in-production-use-stable-random-here"
     ports:
       - "8000:8000"
     volumes:
       # 源码挂载，容器内 reload 不用 rebuild
-      - ./src:/app/src
-      - ./alembic:/app/alembic
-      - ./scripts:/app/scripts
+      - ./apps/api/src:/app/src
+      - ./apps/api/alembic:/app/alembic
 
 volumes:
   postgres_data:

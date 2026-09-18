@@ -34,8 +34,26 @@ from .release import (
     PreflightReport,
 )
 from .governance import PluginInstallation, AuditEvent, DriftProposal, HealthSnapshot
-from .identity import User, Membership, GlobalRole, Role, has_role
+from .identity import User, Membership, GlobalRole, Role, has_role, ApiKey
 from .connector import Connector, ConnectorType, ConnectorStatus
+from .webhook import (
+    WebhookConfig,
+    WebhookDelivery,
+    WebhookEventType,
+    WebhookDeliveryStatus,
+    TriggerConfig,
+    TriggerType,
+    TriggerStatus,
+)
+from .workflow import (
+    Workflow,
+    WorkflowExecution,
+    WorkflowStepResult,
+    WorkflowStatus,
+    WorkflowExecutionStatus,
+    WorkflowStepStatus,
+    WorkflowStepType,
+)
 
 __all__ = [
     "Base",
@@ -107,8 +125,25 @@ __all__ = [
     "GlobalRole",
     "Role",
     "has_role",
+    "ApiKey",  # HIA-64 B1
     # Connector 框架（HIA-71）
     "Connector",
     "ConnectorType",
     "ConnectorStatus",
+    # Webhook/Trigger 框架（HIA-75 C3）
+    "WebhookConfig",
+    "WebhookDelivery",
+    "WebhookEventType",
+    "WebhookDeliveryStatus",
+    "TriggerConfig",
+    "TriggerType",
+    "TriggerStatus",
+    # Workflow 编排（HIA-76 C4）
+    "Workflow",
+    "WorkflowExecution",
+    "WorkflowStepResult",
+    "WorkflowStatus",
+    "WorkflowExecutionStatus",
+    "WorkflowStepStatus",
+    "WorkflowStepType",
 ]

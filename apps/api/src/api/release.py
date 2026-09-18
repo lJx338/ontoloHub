@@ -11,6 +11,7 @@ HIA-69 / B5 CR 工作流增强：
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 import hashlib
 import json
@@ -617,6 +618,30 @@ async def create_change_request(
         await session.flush()
 
     await session.refresh(cr)
+
+    # HIA-75 C3: cr.created webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_CREATED,
+            target_type="change_request",
+            target_id=cr.id,
+            extra={"title": cr.title},
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_CREATED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr.id,
+        ))
+    except Exception:
+        pass
+
     return _cr_to_response(cr)
 
 
@@ -702,6 +727,30 @@ async def submit_change_request(
 
     await session.flush()
     await session.refresh(cr)
+
+    # HIA-75 C3: cr.submitted webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_SUBMITTED,
+            target_type="change_request",
+            target_id=cr.id,
+            extra={"title": cr.title, "submitted_by": str(data.submitted_by) if data.submitted_by else None},
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_SUBMITTED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr.id,
+        ))
+    except Exception:
+        pass
+
     return _cr_to_response(cr)
 
 
@@ -735,6 +784,30 @@ async def approve_change_request(
 
     await session.flush()
     await session.refresh(cr)
+
+    # HIA-75 C3: cr.approved webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_APPROVED,
+            target_type="change_request",
+            target_id=cr.id,
+            extra={"title": cr.title, "approved_by": str(data.approved_by) if data.approved_by else None},
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_APPROVED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr.id,
+        ))
+    except Exception:
+        pass
+
     return _cr_to_response(cr)
 
 
@@ -766,6 +839,30 @@ async def reject_change_request(
 
     await session.flush()
     await session.refresh(cr)
+
+    # HIA-75 C3: cr.rejected webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_REJECTED,
+            target_type="change_request",
+            target_id=cr.id,
+            extra={"title": cr.title, "review_notes": data.review_notes},
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_REJECTED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr.id,
+        ))
+    except Exception:
+        pass
+
     return _cr_to_response(cr)
 
 
@@ -792,6 +889,30 @@ async def close_change_request(
 
     await session.flush()
     await session.refresh(cr)
+
+    # HIA-75 C3: cr.closed webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_CLOSED,
+            target_type="change_request",
+            target_id=cr.id,
+            extra={"title": cr.title, "close_reason": data.close_reason},
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_CLOSED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr.id,
+        ))
+    except Exception:
+        pass
+
     return _cr_to_response(cr)
 
 
@@ -826,6 +947,35 @@ async def merge_change_request(
 
     await session.flush()
     await session.refresh(cr)
+
+    # HIA-75 C3: 发出 cr.merged webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_MERGED,
+            target_type="change_request",
+            target_id=cr.id,
+            extra={
+                "title": cr.title,
+                "baseline_version": cr.baseline_version,
+                "target_version": cr.target_version,
+                "merged_by": str(data.merged_by) if data.merged_by else None,
+            },
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_MERGED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr.id,
+        ))
+    except Exception:
+        pass  # 不阻断 CR 合并
+
     return _cr_to_response(cr)
 
 
@@ -1102,6 +1252,36 @@ async def create_comment(
     session.add(comment)
     await session.flush()
     await session.refresh(comment)
+
+    # HIA-75 C3: cr.comment_added webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_COMMENT_ADDED,
+            target_type="change_request",
+            target_id=cr_id,
+            actor_id=data.author_id,
+            actor_name=data.author_name,
+            extra={
+                "comment_id": str(comment.id),
+                "parent_id": str(data.parent_id) if data.parent_id else None,
+                "body_preview": data.body[:200],
+            },
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_COMMENT_ADDED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr_id,
+        ))
+    except Exception:
+        pass
+
     return _comment_to_response(comment)
 
 
@@ -1132,6 +1312,213 @@ async def delete_comment(
         raise HTTPException(status_code=404, detail="评论不存在")
 
     comment.deleted_at = _now_utc()
+
+
+# =============================================================================
+# CR Diff（HIA-57 / A10 收尾补全）
+# =============================================================================
+
+
+class ChangeRequestDiffEntry(BaseModel):
+    """CR diff 单条记录"""
+
+    kind: str  # "class" / "property" / "relation" / "constraint"
+    iri: Optional[str] = None
+    name: str = ""
+    change: str  # "added" / "removed" / "modified" / "unchanged"
+    details: dict = Field(default_factory=dict)
+
+
+class ChangeRequestDiffResponse(BaseModel):
+    """CR diff 响应"""
+
+    cr_id: uuid.UUID
+    baseline_version_id: Optional[uuid.UUID]
+    baseline_version: Optional[str]
+    target_version_id: Optional[uuid.UUID]
+    target_version: Optional[str]
+    diff: list[ChangeRequestDiffEntry]
+    summary: dict
+    computed_from: str  # "stored" | "snapshots"
+
+
+def _diff_snapshots(
+    from_snap: dict,
+    to_snap: dict,
+) -> tuple[list[ChangeRequestDiffEntry], dict]:
+    """对比两个 OntologyVersion 快照，返回 diff 列表 + summary。
+
+    HIA-57: 简化版的快照对比，覆盖 class / property / relation 三个维度。
+    与 ontologies.py::diff_ontology_versions 的差异在于：
+    - 返回扁平条目（每条带 kind 字段），便于 CR diff 视图按时间序展示
+    - 约束对比暂略（约束快照在 ontology 版本里较少用，可后续扩展）
+    """
+    diffs: list[ChangeRequestDiffEntry] = []
+    summary = {"added": 0, "removed": 0, "modified": 0, "unchanged": 0}
+
+    for kind in ("class_snapshot", "property_snapshot", "relation_snapshot"):
+        from_items = {
+            item.get("iri"): item
+            for item in (from_snap.get(kind) or [])
+            if item.get("iri")
+        }
+        to_items = {
+            item.get("iri"): item
+            for item in (to_snap.get(kind) or [])
+            if item.get("iri")
+        }
+
+        kind_label = kind.replace("_snapshot", "")
+
+        for iri, item in to_items.items():
+            if iri not in from_items:
+                diffs.append(
+                    ChangeRequestDiffEntry(
+                        kind=kind_label,
+                        iri=iri,
+                        name=item.get("name", ""),
+                        change="added",
+                    )
+                )
+                summary["added"] += 1
+            else:
+                from_item = from_items[iri]
+                if item != from_item:
+                    diffs.append(
+                        ChangeRequestDiffEntry(
+                            kind=kind_label,
+                            iri=iri,
+                            name=item.get("name", ""),
+                            change="modified",
+                            details={
+                                "before": {
+                                    k: v
+                                    for k, v in from_item.items()
+                                    if k != "iri" and from_item.get(k) != item.get(k)
+                                },
+                                "after": {
+                                    k: v
+                                    for k, v in item.items()
+                                    if k != "iri" and from_item.get(k) != item.get(k)
+                                },
+                            },
+                        )
+                    )
+                    summary["modified"] += 1
+                else:
+                    diffs.append(
+                        ChangeRequestDiffEntry(
+                            kind=kind_label,
+                            iri=iri,
+                            name=item.get("name", ""),
+                            change="unchanged",
+                        )
+                    )
+                    summary["unchanged"] += 1
+        for iri, item in from_items.items():
+            if iri not in to_items:
+                diffs.append(
+                    ChangeRequestDiffEntry(
+                        kind=kind_label,
+                        iri=iri,
+                        name=item.get("name", ""),
+                        change="removed",
+                    )
+                )
+                summary["removed"] += 1
+
+    return diffs, summary
+
+
+@cr_router.get("/{cr_id}/diff", response_model=ChangeRequestDiffResponse)
+async def get_change_request_diff(
+    cr_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+) -> ChangeRequestDiffResponse:
+    """获取 CR 的 baseline/target 本体版本差异。
+
+    HIA-57 spec: ``GET /change-requests/{cr_id}/diff`` — 与 base 的 diff。
+
+    解析逻辑：
+    1. 若 ``ChangeRequest.diff`` 字段已存（外部预计算或主动写入），
+       直接返回，避免重算
+    2. 否则查 ``baseline_version_id`` / ``target_version_id`` 对应的
+       ``OntologyVersion`` 行，从 ``class_snapshot`` / ``property_snapshot``
+       / ``relation_snapshot`` 计算 diff
+    3. 若两者都缺失，回 422 提示 CR 未设置版本
+
+    注意：CR 的 ``baseline_version_id`` / ``target_version_id`` 没有显式
+    FK（按 HIA-69 设计：可指向 OntologyVersion、MappingVersion 等），本
+    端点优先尝试按 OntologyVersion 解析；找不到时回 404。
+    """
+    cr = await _verify_cr_exists(session, cr_id)
+
+    # Case 1: stored diff — 已写入的预计算结果
+    if cr.diff:
+        return ChangeRequestDiffResponse(
+            cr_id=cr.id,
+            baseline_version_id=cr.baseline_version_id,
+            baseline_version=cr.baseline_version,
+            target_version_id=cr.target_version_id,
+            target_version=cr.target_version,
+            diff=[
+                ChangeRequestDiffEntry(**e)
+                for e in cr.diff.get("entries", [])
+            ],
+            summary=cr.diff.get("summary", {}),
+            computed_from="stored",
+        )
+
+    # Case 2: compute from OntologyVersion snapshots
+    if not (cr.baseline_version_id and cr.target_version_id):
+        raise HTTPException(
+            status_code=422,
+            detail="CR 缺少 baseline_version_id / target_version_id，无法计算 diff",
+        )
+
+    from_result = await session.execute(
+        select(OntologyVersion).where(OntologyVersion.id == cr.baseline_version_id)
+    )
+    from_v = from_result.scalar_one_or_none()
+    if not from_v:
+        raise HTTPException(
+            status_code=404,
+            detail=f"baseline 版本 {cr.baseline_version_id} 不存在",
+        )
+
+    to_result = await session.execute(
+        select(OntologyVersion).where(OntologyVersion.id == cr.target_version_id)
+    )
+    to_v = to_result.scalar_one_or_none()
+    if not to_v:
+        raise HTTPException(
+            status_code=404,
+            detail=f"target 版本 {cr.target_version_id} 不存在",
+        )
+
+    from_snap = {
+        "class_snapshot": from_v.class_snapshot or [],
+        "property_snapshot": from_v.property_snapshot or [],
+        "relation_snapshot": from_v.relation_snapshot or [],
+    }
+    to_snap = {
+        "class_snapshot": to_v.class_snapshot or [],
+        "property_snapshot": to_v.property_snapshot or [],
+        "relation_snapshot": to_v.relation_snapshot or [],
+    }
+
+    diffs, summary = _diff_snapshots(from_snap, to_snap)
+
+    return ChangeRequestDiffResponse(
+        cr_id=cr.id,
+        baseline_version_id=from_v.id,
+        baseline_version=from_v.version,
+        target_version_id=to_v.id,
+        target_version=to_v.version,
+        diff=diffs,
+        summary=summary,
+        computed_from="snapshots",
+    )
 
 
 # =============================================================================
@@ -1252,8 +1639,10 @@ async def update_release(
 
     update_data = data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
-        if field == "tags" and release.artifacts:
-            release.artifacts["tags"] = value
+        if field == "tags":
+            # tags 存在 artifacts JSON 里；如果 artifacts 还没初始化就创建空 dict
+            current = release.artifacts or {}
+            release.artifacts = {**current, "tags": value}
         else:
             setattr(release, field, value)
 
@@ -1373,6 +1762,32 @@ async def publish_release(
     await session.flush()
     await session.refresh(release)
 
+    # HIA-75 C3: release.published webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.RELEASE_PUBLISHED,
+            target_type="release",
+            target_id=release.id,
+            extra={
+                "version": release.version,
+                "checksum": release.checksum,
+            },
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.RELEASE_PUBLISHED,
+            project_id=release.project_id,
+            payload=payload,
+            target_type="release",
+            target_id=release.id,
+        ))
+    except Exception:
+        pass
+
     return _release_to_response(release)
 
 
@@ -1397,7 +1812,6 @@ async def list_project_deployments(
         select(Deployment)
         .join(Release)
         .where(Release.project_id == project_id)
-        .options(selectinload(Deployment.release))
     )
 
     if status is not None:
@@ -1469,6 +1883,34 @@ async def create_deployment(
 
     await session.flush()
     await session.refresh(deployment)
+
+    # HIA-75 C3: deployment.succeeded webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.DEPLOYMENT_SUCCEEDED,
+            target_type="deployment",
+            target_id=deployment.id,
+            extra={
+                "environment": data.environment,
+                "release_version": release.version,
+                "duration_ms": duration_ms,
+            },
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.DEPLOYMENT_SUCCEEDED,
+            project_id=project_id,
+            payload=payload,
+            target_type="deployment",
+            target_id=deployment.id,
+        ))
+    except Exception:
+        pass
+
     return _deployment_to_response(deployment)
 
 
@@ -1479,9 +1921,7 @@ async def get_deployment(
 ) -> DeploymentResponse:
     """获取部署详情。"""
     result = await session.execute(
-        select(Deployment)
-        .where(Deployment.id == deployment_id)
-        .options(selectinload(Deployment.release))
+        select(Deployment).where(Deployment.id == deployment_id)
     )
     deployment = result.scalar_one_or_none()
 
@@ -1499,9 +1939,7 @@ async def update_deployment(
 ) -> DeploymentResponse:
     """更新部署状态。"""
     result = await session.execute(
-        select(Deployment)
-        .where(Deployment.id == deployment_id)
-        .options(selectinload(Deployment.release))
+        select(Deployment).where(Deployment.id == deployment_id)
     )
     deployment = result.scalar_one_or_none()
 
@@ -1525,9 +1963,7 @@ async def rollback_deployment(
 ) -> DeploymentResponse:
     """回滚部署。"""
     result = await session.execute(
-        select(Deployment)
-        .where(Deployment.id == deployment_id)
-        .options(selectinload(Deployment.release))
+        select(Deployment).where(Deployment.id == deployment_id)
     )
     deployment = result.scalar_one_or_none()
 
@@ -1547,6 +1983,32 @@ async def rollback_deployment(
     await session.flush()
     await session.refresh(deployment)
 
+    # HIA-75 C3: deployment.rollback webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.DEPLOYMENT_ROLLBACK,
+            target_type="deployment",
+            target_id=deployment.id,
+            extra={
+                "environment": deployment.environment,
+                "rolled_back_at": deployment.completed_at.isoformat() if deployment.completed_at else None,
+            },
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.DEPLOYMENT_ROLLBACK,
+            project_id=deployment.project_id,
+            payload=payload,
+            target_type="deployment",
+            target_id=deployment.id,
+        ))
+    except Exception:
+        pass
+
     return _deployment_to_response(deployment)
 
 
@@ -1561,6 +2023,7 @@ class UseCaseBundleCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
     version: str = Field(..., min_length=1, max_length=50)
+    release_id: uuid.UUID
     use_case_ids: Optional[list[uuid.UUID]] = None
     ontology_version_id: Optional[uuid.UUID] = None
     mapping_version_id: Optional[uuid.UUID] = None
@@ -1643,9 +2106,13 @@ async def create_use_case_bundle(
 ) -> UseCaseBundleResponse:
     """创建用例包。"""
     await _verify_project_exists(session, project_id)
+    release = await _verify_release_exists(session, data.release_id)
+    if release.project_id != project_id:
+        raise HTTPException(status_code=400, detail="release 不属于该项目")
 
     bundle = UseCaseBundle(
         project_id=project_id,
+        release_id=data.release_id,
         name=data.name,
         description=data.description,
         version=data.version,

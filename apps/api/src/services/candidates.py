@@ -933,6 +933,7 @@ async def generate_candidates_from_evidence(
         created += 1
         profiles.append({
             "field_name": fname,
+            "inferred_type": f_type,            # HIA-72 / HIA-66: 与 Pydantic CandidateProfileItem 对齐
             "evidence_count": len(evs),
             "confidence": confidence_score,
             "confidence_level": confidence_level.value,
