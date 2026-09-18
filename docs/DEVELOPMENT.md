@@ -1708,3 +1708,41 @@ DRAFT ──publish──► BUILT ──(内部)──► RELEASED
 - **不要 mock 数据层**：测试用真 SQLite + alembic up head
 - **不要直接 dump ORM 对象到 response**：必须经 `_to_response()` helper 显式构造
 
+## 21. HIA-57 / A10 Change Request Diff 端点（HIA-57 收尾补全）
+
+### 21.1 新增端点
+
+`apps/api/src/api/release.py` 新增 `GET /change-requests/{cr_id}/diff`：
+
+- 优先返回 `ChangeRequest.diff` JSON 字段（已预计算结果，`computed_from="stored"`）
+- 否则查 `baseline_version_id` / `target_version_id` 对应的 `OntologyVersion`，从快照算 diff（`computed_from="snapshots"`）
+- 若两者都没设置，回 422
+
+### 21.2 关键设计
+
+- **`ChangeRequest.baseline_version_id` / `target_version_id` 没有显式 FK**：按 HIA-69 设计可指向 OntologyVersion / MappingVersion 等；本端点优先按 OntologyVersion 解析
+- **快照对比覆盖 class / property / relation 三维度**：`urn`/`iri` 作为 key，相同 iri 不同内容视为 `modified`（带 `details.before` / `details.after`）
+- **约束对比暂略**：可在 ontologies.py::diff_ontology_versions 已有逻辑上扩展，CR diff 视图暂时不需要
+
+### 21.3 测试覆盖（21 个 CR 测试）
+
+新增 6 个：
+
+- `test_diff_helper_directly_unit` — `_diff_snapshots` 单元测试
+- `test_cr_diff_404_for_nonexistent_cr` — CR 不存在
+- `test_cr_diff_422_without_versions` — 缺 baseline/target
+- `test_cr_diff_returns_stored_diff` — 命中 stored 路径
+- `test_cr_diff_computes_from_snapshots` — 命中 snapshots 路径
+- `test_cr_diff_404_when_version_record_missing` — 版本行被删
+
+### 21.4 测试踩坑
+
+跨 session 写数据必须 **`commit()`**，不能只 `flush()`。HTTP 请求走独立 session，flush 仅事务内可见。
+
+```python
+async with session_factory() as s:
+    cr = await s.get(ChangeRequest, uuid.UUID(cr_id))
+    cr.diff = {"entries": [...], "summary": {...}}
+    await s.commit()  # ← 不要 flush
+```
+

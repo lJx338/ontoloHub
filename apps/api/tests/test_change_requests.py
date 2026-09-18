@@ -21,6 +21,8 @@ from httpx import ASGITransport, AsyncClient
 ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(ROOT / "apps" / "api"))
 
+from src.db.release import ChangeRequest  # noqa: E402  测试需要直接更新 CR 行
+
 
 # ---------- per-test 数据库覆盖 ----------
 
@@ -541,3 +543,303 @@ async def test_list_cr_filter_by_status(client: AsyncClient):
     listed = r.json()
     assert any(c["id"] == cr["id"] for c in listed)
     assert all(c["status"] == "submitted" for c in listed)
+
+
+@pytest.mark.asyncio
+async def test_diff_helper_directly_unit():
+    """_diff_snapshots helper: 直接单元测试，不走 HTTP。
+
+    HIA-57: 验证简化版快照对比逻辑，覆盖 added / removed / modified / unchanged 四种。
+    """
+    from src.api.release import _diff_snapshots, ChangeRequestDiffEntry
+
+    from_snap = {
+        "class_snapshot": [
+            {"iri": "urn:P", "name": "Person"},
+            {"iri": "urn:O", "name": "Order"},
+        ],
+        "property_snapshot": [
+            {"iri": "urn:p1", "name": "id", "domain_iri": "urn:P"},
+        ],
+        "relation_snapshot": [],
+    }
+    to_snap = {
+        "class_snapshot": [
+            {"iri": "urn:P", "name": "PersonRenamed"},  # modified
+            # urn:O removed
+            {"iri": "urn:C", "name": "Company"},  # added
+        ],
+        "property_snapshot": [
+            {"iri": "urn:p1", "name": "id", "domain_iri": "urn:P"},  # unchanged
+            {"iri": "urn:p2", "name": "email", "domain_iri": "urn:P"},  # added
+        ],
+        "relation_snapshot": [],
+    }
+
+    diffs, summary = _diff_snapshots(from_snap, to_snap)
+
+    assert summary == {
+        "added": 2,  # Company + email
+        "removed": 1,  # Order
+        "modified": 1,  # Person name change
+        "unchanged": 1,  # id property
+    }
+    # Person is modified
+    person_modified = [
+        e
+        for e in diffs
+        if e.kind == "class" and e.iri == "urn:P" and e.change == "modified"
+    ]
+    assert len(person_modified) == 1
+    # Person should have details with before/after
+    assert "name" in person_modified[0].details["after"]
+    assert person_modified[0].details["after"]["name"] == "PersonRenamed"
+
+
+# ============================================================
+# Diff 端点（HIA-57 / A10 收尾补全）
+# ============================================================
+
+
+# ============================================================
+# Diff 端点（HIA-57 / A10 收尾补全）
+# ============================================================
+
+
+async def _make_ontology(client: AsyncClient, project_id: str) -> str:
+    """创建一个 ontology，返回 ontology_id。"""
+    r = await client.post(
+        "/ontologies",
+        json={
+            "name": f"Diff Test Ontology {uuid.uuid4()}",
+            "namespace": f"urn:test:{uuid.uuid4()}",
+            "project_id": project_id,
+        },
+        headers={"X-User-Email": EMAIL_ALICE},
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+async def _make_ontology_version_with_snapshots(
+    client: AsyncClient,
+    ontology_id: str,
+    *,
+    version: str,
+    class_snapshot: list[dict],
+    property_snapshot: list[dict],
+    relation_snapshot: list[dict] | None = None,
+) -> str:
+    """创建 ontology version 并直接通过 session 写入快照内容。
+
+    走 API（``PUT /versions/{id}/content``）也行，但要求外层 Pydantic
+    schema 完全对齐；测试里直接 SQLAlchemy 写更稳定。
+    """
+    create_r = await client.post(
+        f"/ontologies/{ontology_id}/versions",
+        json={"version": version},
+        headers={"X-User-Email": EMAIL_ALICE},
+    )
+    assert create_r.status_code == 201, create_r.text
+    version_id = create_r.json()["id"]
+
+    from src.db import connection as conn
+    from src.db.ontology import OntologyVersion
+
+    async with conn.async_session_factory() as s:
+        v = await s.get(OntologyVersion, uuid.UUID(version_id))
+        assert v is not None
+        v.class_snapshot = class_snapshot
+        v.property_snapshot = property_snapshot
+        v.relation_snapshot = relation_snapshot or []
+        await s.commit()
+
+    return version_id
+
+
+async def _set_cr_versions(
+    session_factory,
+    cr_id: str,
+    baseline_version_id: str | None = None,
+    target_version_id: str | None = None,
+    stored_diff: dict | None = None,
+) -> None:
+    """直接通过 session 更新 CR 的 baseline/target/diff 字段。
+
+    公开 API 不支持写 ``baseline_version_id`` / ``target_version_id`` 在
+    同一调用里同时设置，也不支持写 ``diff`` 字段 — 测试需要这些场景。
+
+    **必须 ``commit()``**：HTTP 请求走单独的 session，flush 仅在事务内可
+    见；不 commit 后续 GET 会读不到。
+    """
+    async with session_factory() as s:
+        cr = await s.get(ChangeRequest, uuid.UUID(cr_id))
+        assert cr is not None
+        if baseline_version_id:
+            cr.baseline_version_id = uuid.UUID(baseline_version_id)
+            cr.baseline_version = "v1"
+        if target_version_id:
+            cr.target_version_id = uuid.UUID(target_version_id)
+            cr.target_version = "v2"
+        if stored_diff is not None:
+            cr.diff = stored_diff
+        await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_cr_diff_404_for_nonexistent_cr(client: AsyncClient):
+    """不存在的 CR 应回 404。"""
+    r = await client.get(
+        f"/change-requests/{uuid.uuid4()}/diff",
+        headers={"X-User-Email": EMAIL_ALICE},
+    )
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_cr_diff_422_without_versions(client: AsyncClient):
+    """CR 没有 baseline/target 版本时回 422。"""
+    proj = await _alice_project(client)
+    cr = await _create_cr(client, proj)
+
+    r = await client.get(
+        f"/change-requests/{cr['id']}/diff",
+        headers={"X-User-Email": EMAIL_ALICE},
+    )
+    assert r.status_code == 422
+    assert "baseline_version_id" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_cr_diff_returns_stored_diff(client: AsyncClient, isolated_app):
+    """CR.diff 已写入时直接返回（computed_from=stored）。"""
+    proj = await _alice_project(client)
+    cr = await _create_cr(client, proj)
+
+    stored = {
+        "entries": [
+            {
+                "kind": "class",
+                "iri": "urn:test:Person",
+                "name": "Person",
+                "change": "added",
+            },
+            {
+                "kind": "property",
+                "iri": "urn:test:email",
+                "name": "email",
+                "change": "modified",
+            },
+        ],
+        "summary": {"added": 1, "removed": 0, "modified": 1, "unchanged": 0},
+    }
+
+    _, app = isolated_app
+    from src.db import connection as conn
+
+    await _set_cr_versions(
+        conn.async_session_factory,
+        cr["id"],
+        stored_diff=stored,
+    )
+
+    r = await client.get(
+        f"/change-requests/{cr['id']}/diff",
+        headers={"X-User-Email": EMAIL_ALICE},
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["computed_from"] == "stored"
+    assert data["summary"] == stored["summary"]
+    assert len(data["diff"]) == 2
+    assert data["diff"][0]["kind"] == "class"
+    assert data["diff"][0]["change"] == "added"
+
+
+@pytest.mark.asyncio
+async def test_cr_diff_computes_from_snapshots(client: AsyncClient):
+    """从 OntologyVersion 快照计算 diff（computed_from=snapshots）。"""
+    proj = await _alice_project(client)
+    onto_id = await _make_ontology(client, proj)
+
+    # baseline: 1 class (Person), 1 property (id) — 用 iri 字段标识
+    baseline = await _make_ontology_version_with_snapshots(
+        client,
+        onto_id,
+        version="v1",
+        class_snapshot=[
+            {"iri": "urn:test:Person", "name": "Person"},
+        ],
+        property_snapshot=[
+            {"iri": "urn:test:person_id", "name": "id", "domain_iri": "urn:test:Person"},
+        ],
+    )
+
+    # target: 2 classes (Person, Company), 2 properties (id, email)
+    target = await _make_ontology_version_with_snapshots(
+        client,
+        onto_id,
+        version="v2",
+        class_snapshot=[
+            {"iri": "urn:test:Person", "name": "Person"},
+            {"iri": "urn:test:Company", "name": "Company"},
+        ],
+        property_snapshot=[
+            {"iri": "urn:test:person_id", "name": "id", "domain_iri": "urn:test:Person"},
+            {"iri": "urn:test:person_email", "name": "email", "domain_iri": "urn:test:Person"},
+        ],
+    )
+
+    cr = await _create_cr(client, proj)
+
+    # Bind baseline + target to CR via session
+    from src.db import connection as conn
+
+    await _set_cr_versions(
+        conn.async_session_factory,
+        cr["id"],
+        baseline_version_id=baseline,
+        target_version_id=target,
+    )
+
+    r = await client.get(
+        f"/change-requests/{cr['id']}/diff",
+        headers={"X-User-Email": EMAIL_ALICE},
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["computed_from"] == "snapshots"
+    assert data["baseline_version_id"] == baseline
+    assert data["target_version_id"] == target
+    # Company class + email property should be 'added'
+    assert data["summary"]["added"] == 2
+    assert data["summary"]["unchanged"] >= 1  # Person class + person_id property
+    # Diff entries should include the new Company class
+    added_classes = [
+        e for e in data["diff"] if e["kind"] == "class" and e["change"] == "added"
+    ]
+    added_names = {e["name"] for e in added_classes}
+    assert "Company" in added_names
+
+
+@pytest.mark.asyncio
+async def test_cr_diff_404_when_version_record_missing(client: AsyncClient, isolated_app):
+    """baseline_version_id 指向不存在的 OntologyVersion 时回 404。"""
+    proj = await _alice_project(client)
+    cr = await _create_cr(client, proj)
+
+    from src.db import connection as conn
+
+    # Set baseline_version_id to a valid UUID but the row doesn't exist
+    fake_uuid = str(uuid.uuid4())
+    async with conn.async_session_factory() as s:
+        cr_obj = await s.get(ChangeRequest, uuid.UUID(cr["id"]))
+        cr_obj.baseline_version_id = uuid.UUID(fake_uuid)
+        cr_obj.target_version_id = uuid.UUID(str(uuid.uuid4()))
+        await s.commit()
+
+    r = await client.get(
+        f"/change-requests/{cr['id']}/diff",
+        headers={"X-User-Email": EMAIL_ALICE},
+    )
+    assert r.status_code == 404

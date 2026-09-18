@@ -1135,6 +1135,213 @@ async def delete_comment(
 
 
 # =============================================================================
+# CR Diff（HIA-57 / A10 收尾补全）
+# =============================================================================
+
+
+class ChangeRequestDiffEntry(BaseModel):
+    """CR diff 单条记录"""
+
+    kind: str  # "class" / "property" / "relation" / "constraint"
+    iri: Optional[str] = None
+    name: str = ""
+    change: str  # "added" / "removed" / "modified" / "unchanged"
+    details: dict = Field(default_factory=dict)
+
+
+class ChangeRequestDiffResponse(BaseModel):
+    """CR diff 响应"""
+
+    cr_id: uuid.UUID
+    baseline_version_id: Optional[uuid.UUID]
+    baseline_version: Optional[str]
+    target_version_id: Optional[uuid.UUID]
+    target_version: Optional[str]
+    diff: list[ChangeRequestDiffEntry]
+    summary: dict
+    computed_from: str  # "stored" | "snapshots"
+
+
+def _diff_snapshots(
+    from_snap: dict,
+    to_snap: dict,
+) -> tuple[list[ChangeRequestDiffEntry], dict]:
+    """对比两个 OntologyVersion 快照，返回 diff 列表 + summary。
+
+    HIA-57: 简化版的快照对比，覆盖 class / property / relation 三个维度。
+    与 ontologies.py::diff_ontology_versions 的差异在于：
+    - 返回扁平条目（每条带 kind 字段），便于 CR diff 视图按时间序展示
+    - 约束对比暂略（约束快照在 ontology 版本里较少用，可后续扩展）
+    """
+    diffs: list[ChangeRequestDiffEntry] = []
+    summary = {"added": 0, "removed": 0, "modified": 0, "unchanged": 0}
+
+    for kind in ("class_snapshot", "property_snapshot", "relation_snapshot"):
+        from_items = {
+            item.get("iri"): item
+            for item in (from_snap.get(kind) or [])
+            if item.get("iri")
+        }
+        to_items = {
+            item.get("iri"): item
+            for item in (to_snap.get(kind) or [])
+            if item.get("iri")
+        }
+
+        kind_label = kind.replace("_snapshot", "")
+
+        for iri, item in to_items.items():
+            if iri not in from_items:
+                diffs.append(
+                    ChangeRequestDiffEntry(
+                        kind=kind_label,
+                        iri=iri,
+                        name=item.get("name", ""),
+                        change="added",
+                    )
+                )
+                summary["added"] += 1
+            else:
+                from_item = from_items[iri]
+                if item != from_item:
+                    diffs.append(
+                        ChangeRequestDiffEntry(
+                            kind=kind_label,
+                            iri=iri,
+                            name=item.get("name", ""),
+                            change="modified",
+                            details={
+                                "before": {
+                                    k: v
+                                    for k, v in from_item.items()
+                                    if k != "iri" and from_item.get(k) != item.get(k)
+                                },
+                                "after": {
+                                    k: v
+                                    for k, v in item.items()
+                                    if k != "iri" and from_item.get(k) != item.get(k)
+                                },
+                            },
+                        )
+                    )
+                    summary["modified"] += 1
+                else:
+                    diffs.append(
+                        ChangeRequestDiffEntry(
+                            kind=kind_label,
+                            iri=iri,
+                            name=item.get("name", ""),
+                            change="unchanged",
+                        )
+                    )
+                    summary["unchanged"] += 1
+        for iri, item in from_items.items():
+            if iri not in to_items:
+                diffs.append(
+                    ChangeRequestDiffEntry(
+                        kind=kind_label,
+                        iri=iri,
+                        name=item.get("name", ""),
+                        change="removed",
+                    )
+                )
+                summary["removed"] += 1
+
+    return diffs, summary
+
+
+@cr_router.get("/{cr_id}/diff", response_model=ChangeRequestDiffResponse)
+async def get_change_request_diff(
+    cr_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+) -> ChangeRequestDiffResponse:
+    """获取 CR 的 baseline/target 本体版本差异。
+
+    HIA-57 spec: ``GET /change-requests/{cr_id}/diff`` — 与 base 的 diff。
+
+    解析逻辑：
+    1. 若 ``ChangeRequest.diff`` 字段已存（外部预计算或主动写入），
+       直接返回，避免重算
+    2. 否则查 ``baseline_version_id`` / ``target_version_id`` 对应的
+       ``OntologyVersion`` 行，从 ``class_snapshot`` / ``property_snapshot``
+       / ``relation_snapshot`` 计算 diff
+    3. 若两者都缺失，回 422 提示 CR 未设置版本
+
+    注意：CR 的 ``baseline_version_id`` / ``target_version_id`` 没有显式
+    FK（按 HIA-69 设计：可指向 OntologyVersion、MappingVersion 等），本
+    端点优先尝试按 OntologyVersion 解析；找不到时回 404。
+    """
+    cr = await _verify_cr_exists(session, cr_id)
+
+    # Case 1: stored diff — 已写入的预计算结果
+    if cr.diff:
+        return ChangeRequestDiffResponse(
+            cr_id=cr.id,
+            baseline_version_id=cr.baseline_version_id,
+            baseline_version=cr.baseline_version,
+            target_version_id=cr.target_version_id,
+            target_version=cr.target_version,
+            diff=[
+                ChangeRequestDiffEntry(**e)
+                for e in cr.diff.get("entries", [])
+            ],
+            summary=cr.diff.get("summary", {}),
+            computed_from="stored",
+        )
+
+    # Case 2: compute from OntologyVersion snapshots
+    if not (cr.baseline_version_id and cr.target_version_id):
+        raise HTTPException(
+            status_code=422,
+            detail="CR 缺少 baseline_version_id / target_version_id，无法计算 diff",
+        )
+
+    from_result = await session.execute(
+        select(OntologyVersion).where(OntologyVersion.id == cr.baseline_version_id)
+    )
+    from_v = from_result.scalar_one_or_none()
+    if not from_v:
+        raise HTTPException(
+            status_code=404,
+            detail=f"baseline 版本 {cr.baseline_version_id} 不存在",
+        )
+
+    to_result = await session.execute(
+        select(OntologyVersion).where(OntologyVersion.id == cr.target_version_id)
+    )
+    to_v = to_result.scalar_one_or_none()
+    if not to_v:
+        raise HTTPException(
+            status_code=404,
+            detail=f"target 版本 {cr.target_version_id} 不存在",
+        )
+
+    from_snap = {
+        "class_snapshot": from_v.class_snapshot or [],
+        "property_snapshot": from_v.property_snapshot or [],
+        "relation_snapshot": from_v.relation_snapshot or [],
+    }
+    to_snap = {
+        "class_snapshot": to_v.class_snapshot or [],
+        "property_snapshot": to_v.property_snapshot or [],
+        "relation_snapshot": to_v.relation_snapshot or [],
+    }
+
+    diffs, summary = _diff_snapshots(from_snap, to_snap)
+
+    return ChangeRequestDiffResponse(
+        cr_id=cr.id,
+        baseline_version_id=from_v.id,
+        baseline_version=from_v.version,
+        target_version_id=to_v.id,
+        target_version=to_v.version,
+        diff=diffs,
+        summary=summary,
+        computed_from="snapshots",
+    )
+
+
+# =============================================================================
 # 发布路由
 # =============================================================================
 
