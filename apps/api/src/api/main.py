@@ -188,6 +188,10 @@ from src.api.release import router as release_router, cr_router as change_reques
 app.include_router(release_router)
 app.include_router(change_request_router)
 
+# HIA-70 C1: Action / Function 编辑器 API（ActionType CRUD + ActionRun 执行）
+from src.api.action import router as action_router
+app.include_router(action_router)
+
 
 @app.get("/api")
 async def api_root() -> dict:
@@ -213,6 +217,8 @@ async def api_root() -> dict:
             "releases": "/releases",
             "change_requests": "/change-requests",
             "deployments": "/deployments",
+            "actions": "/projects/{id}/actions",
+            "action_runs": "/projects/{id}/action-runs",
             "users": "/api/users",
             "members": "/projects/{id}/members",
             "audit": "/projects/{id}/audit",
