@@ -481,9 +481,8 @@ async def _execute_action(run_id: uuid.UUID, at: ActionType, session: AsyncSessi
             code = at.code or ""
             runtime = (at.runtime or "python").lower()
 
-            # HIA-78 C2：沙箱执行（占位实现，超时 30s）
-            # 真实实现：tempfile + subprocess + timeout（见 HIA-78）
-            result = await _sandbox_execute(code, runtime, input_data or {})
+            # HIA-78 C2：使用真正的 sandbox 模块执行
+            result = await _sandbox_execute(code, runtime, input_data or {}, at.config)
             await _mark_done(ActionRunStatus.SUCCESS, output=result)
             return
 
@@ -502,41 +501,54 @@ async def _execute_action(run_id: uuid.UUID, at: ActionType, session: AsyncSessi
         await _mark_done(ActionRunStatus.FAILED, error=f"{type(exc).__name__}: {exc}")
 
 
-async def _sandbox_execute(code: str, runtime: str, input_data: dict) -> dict:
-    """沙箱执行代码片段（HIA-78 C2 占位）。
+async def _sandbox_execute(
+    code: str, runtime: str, input_data: dict, config: Optional[dict] = None
+) -> dict:
+    """HIA-78 C2: 使用 sandbox 模块执行代码。
 
-    当前实现：直接在当前进程 exec/eval。
-    ⚠️ 占位实现：生产环境必须替换为 subprocess + timeout 隔离执行。
+    真正的 sandbox：subprocess + timeout + (Unix) rlimit。
+    - Python: execute_python() — subprocess 隔离，timeout 强制
+    - JavaScript: execute_javascript() — Node subprocess，timeout 强制
     """
-    import io, sys, contextlib
+    from src.runtime.sandbox import (
+        execute_python,
+        execute_javascript,
+        SandboxError as SBXError,
+    )
 
-    output = {"stdout": "", "stderr": "", "result": None}
+    cfg = config or {}
+    timeout_s = cfg.get("timeout_s", 30)
 
-    if runtime == "python":
-        # 注入 input_data 作为局部变量
-        local_vars = dict(input_data)
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        try:
-            captured = io.StringIO()
-            sys.stdout = captured
-            sys.stderr = captured
-            exec(code, {"__builtins__": __builtins__}, local_vars)
-            output["stdout"] = captured.getvalue()
-            output["result"] = local_vars.get("result")
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
+    try:
+        if runtime == "python":
+            result = execute_python(
+                code=code,
+                input_data=input_data,
+                secrets=cfg.get("secrets"),
+                timeout=timeout_s,
+            )
+            return result.to_dict()
 
-    elif runtime == "javascript":
-        # 简单 node 评估（无 subprocess 占位）
-        output["stderr"] = "JavaScript sandbox not yet implemented (HIA-78 C2)"
-        output["result"] = {"note": "use python runtime for now"}
+        elif runtime == "javascript":
+            result = execute_javascript(
+                code=code,
+                input_data=input_data,
+                timeout=timeout_s,
+            )
+            return result.to_dict()
 
-    else:
-        output["stderr"] = f"Unknown runtime: {runtime}"
+        else:
+            return {
+                "stderr": f"Unknown runtime: {runtime}",
+                "result": None,
+            }
 
-    return output
+    except SBXError as exc:
+        return {
+            "stderr": f"[{exc.kind}] {exc.message}",
+            "result": None,
+            "error_kind": exc.kind,
+        }
 
 
 # =====================================================================
