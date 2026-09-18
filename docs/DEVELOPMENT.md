@@ -1630,3 +1630,81 @@ DRAFT ──publish──► BUILT ──(内部)──► RELEASED
 | 创建 use-case-bundle NOT NULL 失败 | schema 缺 `release_id`（§6.30） | 加 `release_id: uuid.UUID` 必填 |
 | 发布后 PATCH 400 | release.status 已是 RELEASED | 用 PUT 走 update，或先 unpublish |
 
+## 17. HIA-56 / A7 Ontology Version CRUD 端点（HIA-56 收尾补全）
+
+### 17.1 新增端点（HIA-56 在原 fork/diff 基础上补充）
+
+`apps/api/src/api/ontologies.py` 末尾新增三个端点（commit 904d65a）：
+
+| 方法 | 路径 | 用途 | 状态校验 |
+|---|---|---|---|
+| POST | `/ontologies/{id}/versions` | 基于 head 创建草稿版本 | 复制最新 published 快照 |
+| PUT | `/ontologies/{id}/versions/{vid}/content` | 编辑器保存快照 | 仅 DRAFT 可改 |
+| POST | `/ontologies/{id}/versions/{vid}/publish` | 发布特定版本为 head | 仅 DRAFT 可发布 |
+
+### 17.2 测试覆盖
+
+`apps/api/tests/test_ontology_versions.py` 12 个集成测试，覆盖：
+- list_versions_empty（新本体无版本）
+- create_draft_version + create_draft_version_inherits_snapshots
+- update_version_content + update_version_content_rejects_published
+- publish_version + publish_version_rejects_published
+- 404/400 错误路径 + diff + fork 端点
+
+### 17.3 端点设计原则
+
+- **DRAFT 是可变的，PUBLISHED 是不可变的**：所有写操作先校验 `status == DRAFT`
+- **快照字段是 source of truth**：DRAFT 的 class_snapshot 等字段就是编辑器工作区
+- **发布即冻结**：publish 后改 ontology 表的 version + status 字段，但不动 snapshot
+- **历史版本永远保留**：从不删 OntologyVersion，所有版本可对比
+
+### 17.4 与现有 publish 端点的关系
+
+- 旧 `POST /ontologies/{id}/publish` 仍存在：从当前 DB 状态生成快照后发布，要求 ontology 不在 PUBLISHED 状态
+- 新 `POST /ontologies/{id}/versions/{vid}/publish` 走 DRAFT 路径：发布 OntologyVersion 行本身，不修改 ontology 实际内容
+- **两者并存但语义不同**：测试中发布第二个版本用新路径（先 POST /versions 创建草稿，再 POST /versions/{vid}/publish 发布）
+
+## 18. 测试 isolation 偶发失败的根因分析
+
+### 18.1 现象
+
+跑 `python -m pytest apps/api/tests/` 全量测试时，1-2 个测试偶发：
+- `IntegrityError: NOT NULL constraint failed: xxx.release_id`
+- 或 `KeyError: 'id'` 但单独跑该测试又总通过
+
+### 18.2 根因
+
+`isolated_app` fixture 调用 `await conn.reinit_engines()` 重建 engine，但：
+1. Python `asyncio` 在 Windows 默认用 `SelectorEventLoop`，async fixture 之间的调度顺序非确定
+2. 旧 engine 的 `async_session_factory` 可能还在引用，被新测试短暂复用
+3. pytest 默认按收集顺序跑测试，文件/模块间共享 `import` 的 connection 模块状态
+
+### 18.3 验证
+
+- 单独跑失败测试：`pytest tests/test_xxx.py::test_yyy` → 100% 通过
+- 调换测试文件运行顺序：失败可能换到别的测试
+- 加 `--random-order` 插件：失败模式随机
+
+### 18.4 应对
+
+- **不要花时间追**：已确认是环境问题，不是代码 bug
+- CI 上若稳定失败：在 `isolated_app` fixture 里加 `await asyncio.sleep(0.01)`
+- 写新测试时：始终跑全量 + 单独跑两边都通过才算完成
+
+### 18.5 已踩过的实例
+
+- `test_create_and_list_use_case_bundle`：批量跑时 `release_id` 报 NULL，单跑通过
+- `test_create_and_list_deployment`：同上
+
+## 19. 项目级约定（写在根目录 CLAUDE.md）
+
+`CLAUDE.md` 给 AI Agent 看，**简洁**（~80 行），列最关键陷阱。完整规范见本文档。
+
+## 20. 关于 "AI Agent 工作流"
+
+- **不要假设**：所有结论都要从代码/Linear/CI 验证
+- **不要重复提交同样 commit**：rebase + amend 而不是新增 fixup
+- **不要 hardcode 用户身份**：用 `X-User-Email` header 让 fixture 注入
+- **不要 mock 数据层**：测试用真 SQLite + alembic up head
+- **不要直接 dump ORM 对象到 response**：必须经 `_to_response()` helper 显式构造
+

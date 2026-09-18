@@ -2344,3 +2344,288 @@ async def diff_ontology_versions(
         constraint_diff=constraint_diff,
         summary=summary,
     )
+
+
+# =====================================================================
+# Version CRUD（HIA-56 / A7）
+# =====================================================================
+
+
+class CreateVersionRequest(BaseModel):
+    """创建草稿版本请求"""
+
+    version: str = Field(
+        default="draft",
+        min_length=1,
+        max_length=50,
+        description="版本标签，如 'draft-1' 或 'v0.2.0'",
+    )
+    change_summary: Optional[str] = Field(
+        None, max_length=1000, description="版本变更说明"
+    )
+
+
+class UpdateVersionContentRequest(BaseModel):
+    """更新版本快照内容（编辑器保存）"""
+
+    class_snapshot: Optional[list[dict]] = None
+    property_snapshot: Optional[list[dict]] = None
+    relation_snapshot: Optional[list[dict]] = None
+    constraint_snapshot: Optional[list[dict]] = None
+    change_summary: Optional[str] = Field(None, max_length=1000)
+
+
+class PublishVersionRequest(BaseModel):
+    """发布版本请求"""
+
+    change_summary: Optional[str] = Field(None, max_length=1000)
+
+
+class VersionDetailResponse(BaseModel):
+    """含快照内容的版本详情"""
+
+    id: uuid.UUID
+    ontology_id: uuid.UUID
+    version: str
+    status: OntologyVersionStatus
+    is_baseline: bool
+    change_summary: Optional[str]
+    published_at: Optional[str]
+    created_at: str
+    updated_at: str
+    class_snapshot: Optional[list] = []
+    property_snapshot: Optional[list] = []
+    relation_snapshot: Optional[list] = []
+    constraint_snapshot: Optional[list] = []
+    class_count: int = 0
+    property_count: int = 0
+    relation_count: int = 0
+    constraint_count: int = 0
+
+    model_config = {"from_attributes": True}
+
+
+@router.post(
+    "/{ontology_id}/versions",
+    response_model=VersionDetailResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_draft_version(
+    ontology_id: uuid.UUID,
+    data: CreateVersionRequest = None,
+    session: AsyncSession = Depends(get_session),
+) -> VersionDetailResponse:
+    """基于当前 head 创建新草稿版本（fork from published head）
+
+    行为：
+    - 找到当前已发布的最新版本作为 parent（若无则创建空快照）
+    - 将其快照内容复制到新的 DRAFT 版本
+    """
+    # 1. 找本体
+    onto_result = await session.execute(
+        select(Ontology).where(Ontology.id == ontology_id)
+    )
+    ontology = onto_result.scalar_one_or_none()
+    if not ontology:
+        raise HTTPException(status_code=404, detail="本体不存在")
+
+    # 2. 找最新发布的版本作为 parent
+    parent_result = await session.execute(
+        select(OntologyVersion)
+        .where(
+            and_(
+                OntologyVersion.ontology_id == ontology_id,
+                OntologyVersion.status == OntologyVersionStatus.PUBLISHED,
+            )
+        )
+        .order_by(OntologyVersion.published_at.desc())
+        .limit(1)
+    )
+    parent = parent_result.scalar_one_or_none()
+
+    # 3. 创建新草稿版本
+    version_tag = (data.version or "draft") if data else "draft"
+
+    new_version = OntologyVersion(
+        ontology_id=ontology_id,
+        version=version_tag,
+        status=OntologyVersionStatus.DRAFT,
+        change_summary=data.change_summary if data else None,
+        # 从 parent 复制快照
+        class_snapshot=(
+            list(parent.class_snapshot) if parent and parent.class_snapshot else []
+        ),
+        property_snapshot=(
+            list(parent.property_snapshot) if parent and parent.property_snapshot else []
+        ),
+        relation_snapshot=(
+            list(parent.relation_snapshot) if parent and parent.relation_snapshot else []
+        ),
+        constraint_snapshot=(
+            list(parent.constraint_snapshot)
+            if parent and parent.constraint_snapshot
+            else []
+        ),
+        baseline_of=parent.id if parent else None,
+    )
+    session.add(new_version)
+    await session.flush()
+    await session.refresh(new_version)
+
+    return VersionDetailResponse(
+        id=new_version.id,
+        ontology_id=new_version.ontology_id,
+        version=new_version.version,
+        status=new_version.status,
+        is_baseline=new_version.is_baseline,
+        change_summary=new_version.change_summary,
+        published_at=_to_iso(new_version.published_at),
+        created_at=_to_iso(new_version.created_at),
+        updated_at=_to_iso(new_version.updated_at),
+        class_snapshot=new_version.class_snapshot or [],
+        property_snapshot=new_version.property_snapshot or [],
+        relation_snapshot=new_version.relation_snapshot or [],
+        constraint_snapshot=new_version.constraint_snapshot or [],
+        class_count=len(new_version.class_snapshot or []),
+        property_count=len(new_version.property_snapshot or []),
+        relation_count=len(new_version.relation_snapshot or []),
+        constraint_count=len(new_version.constraint_snapshot or []),
+    )
+
+
+@router.put(
+    "/{ontology_id}/versions/{version_id}/content",
+    response_model=VersionDetailResponse,
+)
+async def update_version_content(
+    ontology_id: uuid.UUID,
+    version_id: uuid.UUID,
+    data: UpdateVersionContentRequest,
+    session: AsyncSession = Depends(get_session),
+) -> VersionDetailResponse:
+    """更新版本快照内容（编辑器保存）
+
+    行为：
+    - 仅允许更新 DRAFT 状态的版本
+    - 整体替换快照字段
+    """
+    result = await session.execute(
+        select(OntologyVersion).where(
+            and_(
+                OntologyVersion.id == version_id,
+                OntologyVersion.ontology_id == ontology_id,
+            )
+        )
+    )
+    v = result.scalar_one_or_none()
+    if not v:
+        raise HTTPException(status_code=404, detail="版本不存在")
+
+    if v.status != OntologyVersionStatus.DRAFT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"只能修改 DRAFT 状态的版本，当前状态：{v.status.value}",
+        )
+
+    # 整体替换快照
+    if data.class_snapshot is not None:
+        v.class_snapshot = data.class_snapshot
+    if data.property_snapshot is not None:
+        v.property_snapshot = data.property_snapshot
+    if data.relation_snapshot is not None:
+        v.relation_snapshot = data.relation_snapshot
+    if data.constraint_snapshot is not None:
+        v.constraint_snapshot = data.constraint_snapshot
+    if data.change_summary is not None:
+        v.change_summary = data.change_summary
+
+    await session.flush()
+    await session.refresh(v)
+
+    return VersionDetailResponse(
+        id=v.id,
+        ontology_id=v.ontology_id,
+        version=v.version,
+        status=v.status,
+        is_baseline=v.is_baseline,
+        change_summary=v.change_summary,
+        published_at=_to_iso(v.published_at),
+        created_at=_to_iso(v.created_at),
+        updated_at=_to_iso(v.updated_at),
+        class_snapshot=v.class_snapshot or [],
+        property_snapshot=v.property_snapshot or [],
+        relation_snapshot=v.relation_snapshot or [],
+        constraint_snapshot=v.constraint_snapshot or [],
+        class_count=len(v.class_snapshot or []),
+        property_count=len(v.property_snapshot or []),
+        relation_count=len(v.relation_snapshot or []),
+        constraint_count=len(v.constraint_snapshot or []),
+    )
+
+
+@router.post(
+    "/{ontology_id}/versions/{version_id}/publish",
+    response_model=PublishResponse,
+)
+async def publish_version(
+    ontology_id: uuid.UUID,
+    version_id: uuid.UUID,
+    data: PublishVersionRequest = None,
+    session: AsyncSession = Depends(get_session),
+) -> PublishResponse:
+    """将特定版本发布为新的 head
+
+    行为：
+    - 校验版本状态为 DRAFT
+    - 将 version_record 状态置为 PUBLISHED，写入 published_at
+    - 将 ontology.version 更新为该版本标签，ontology.status 置为 PUBLISHED
+    """
+    # 1. 找本体
+    onto_result = await session.execute(
+        select(Ontology).where(Ontology.id == ontology_id)
+    )
+    ontology = onto_result.scalar_one_or_none()
+    if not ontology:
+        raise HTTPException(status_code=404, detail="本体不存在")
+
+    # 2. 找版本
+    result = await session.execute(
+        select(OntologyVersion).where(
+            and_(
+                OntologyVersion.id == version_id,
+                OntologyVersion.ontology_id == ontology_id,
+            )
+        )
+    )
+    v = result.scalar_one_or_none()
+    if not v:
+        raise HTTPException(status_code=404, detail="版本不存在")
+
+    if v.status != OntologyVersionStatus.DRAFT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"只能发布 DRAFT 状态的版本，当前状态：{v.status.value}",
+        )
+
+    # 3. 发布
+    v.status = OntologyVersionStatus.PUBLISHED
+    v.published_at = datetime.now(timezone.utc)
+
+    # 4. 更新本体 head
+    ontology.version = v.version
+    ontology.status = OntologyStatus.PUBLISHED
+    ontology.class_count = len(v.class_snapshot or [])
+    ontology.property_count = len(v.property_snapshot or [])
+
+    await session.flush()
+    await session.refresh(v)
+
+    return PublishResponse(
+        version_id=v.id,
+        version=v.version,
+        snapshot_class_count=len(v.class_snapshot or []),
+        snapshot_property_count=len(v.property_snapshot or []),
+        snapshot_relation_count=len(v.relation_snapshot or []),
+        snapshot_constraint_count=len(v.constraint_snapshot or []),
+        published_at=v.published_at.isoformat() if v.published_at else "",
+    )
