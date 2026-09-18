@@ -51,6 +51,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.cache_ping_stop = stop_event
     app.state.cache_ping_task = ping_task
 
+    # HIA-75 C3: 启动 cron 触发器调度器（每 60s 检查一次）
+    scheduler_stop_event = asyncio.Event()
+    scheduler_task = asyncio.create_task(_cron_loop(scheduler_stop_event, interval=60.0))
+    app.state.scheduler_stop = scheduler_stop_event
+    app.state.scheduler_task = scheduler_task
+
     yield
 
     # 关闭
@@ -59,8 +65,36 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await asyncio.wait_for(ping_task, timeout=2.0)
     except (asyncio.TimeoutError, asyncio.CancelledError):
         pass
+
+    scheduler_stop_event.set()
+    try:
+        await asyncio.wait_for(scheduler_task, timeout=2.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+
     await reset_cache()
     await close_db()
+
+
+async def _cron_loop(stop_event: asyncio.Event, interval: float = 60.0) -> None:
+    """HIA-75 C3: Cron 触发器循环，每 60s 扫一次 schedule 触发器。
+
+    简单实现：每次循环都遍历所有 ACTIVE schedule 触发器，匹配当前时间。
+    对于 1 分钟精度的 cron 表达式足够；高精度需求可后续接入 APScheduler。
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    from src.services.webhook_dispatcher import run_cron_triggers
+
+    while not stop_event.is_set():
+        try:
+            await run_cron_triggers()
+        except Exception as exc:
+            logger.warning("cron loop iteration failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            continue
 
 
 # 创建 FastAPI 应用
@@ -191,6 +225,11 @@ app.include_router(change_request_router)
 # HIA-70 C1: Action / Function 编辑器 API（ActionType CRUD + ActionRun 执行）
 from src.api.action import router as action_router
 app.include_router(action_router)
+
+# HIA-75 C3: Webhook / Trigger 集成 API
+from src.api.webhooks import router as webhooks_router, trigger_router
+app.include_router(webhooks_router)
+app.include_router(trigger_router)
 
 
 @app.get("/api")

@@ -36,6 +36,15 @@ from .release import (
 from .governance import PluginInstallation, AuditEvent, DriftProposal, HealthSnapshot
 from .identity import User, Membership, GlobalRole, Role, has_role, ApiKey
 from .connector import Connector, ConnectorType, ConnectorStatus
+from .webhook import (
+    WebhookConfig,
+    WebhookDelivery,
+    WebhookEventType,
+    WebhookDeliveryStatus,
+    TriggerConfig,
+    TriggerType,
+    TriggerStatus,
+)
 
 __all__ = [
     "Base",
@@ -112,4 +121,12 @@ __all__ = [
     "Connector",
     "ConnectorType",
     "ConnectorStatus",
+    # Webhook/Trigger 框架（HIA-75 C3）
+    "WebhookConfig",
+    "WebhookDelivery",
+    "WebhookEventType",
+    "WebhookDeliveryStatus",
+    "TriggerConfig",
+    "TriggerType",
+    "TriggerStatus",
 ]

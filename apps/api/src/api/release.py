@@ -11,6 +11,7 @@ HIA-69 / B5 CR 工作流增强：
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 import hashlib
 import json
@@ -617,6 +618,30 @@ async def create_change_request(
         await session.flush()
 
     await session.refresh(cr)
+
+    # HIA-75 C3: cr.created webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_CREATED,
+            target_type="change_request",
+            target_id=cr.id,
+            extra={"title": cr.title},
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_CREATED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr.id,
+        ))
+    except Exception:
+        pass
+
     return _cr_to_response(cr)
 
 
@@ -702,6 +727,30 @@ async def submit_change_request(
 
     await session.flush()
     await session.refresh(cr)
+
+    # HIA-75 C3: cr.submitted webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_SUBMITTED,
+            target_type="change_request",
+            target_id=cr.id,
+            extra={"title": cr.title, "submitted_by": str(data.submitted_by) if data.submitted_by else None},
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_SUBMITTED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr.id,
+        ))
+    except Exception:
+        pass
+
     return _cr_to_response(cr)
 
 
@@ -735,6 +784,30 @@ async def approve_change_request(
 
     await session.flush()
     await session.refresh(cr)
+
+    # HIA-75 C3: cr.approved webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_APPROVED,
+            target_type="change_request",
+            target_id=cr.id,
+            extra={"title": cr.title, "approved_by": str(data.approved_by) if data.approved_by else None},
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_APPROVED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr.id,
+        ))
+    except Exception:
+        pass
+
     return _cr_to_response(cr)
 
 
@@ -766,6 +839,30 @@ async def reject_change_request(
 
     await session.flush()
     await session.refresh(cr)
+
+    # HIA-75 C3: cr.rejected webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_REJECTED,
+            target_type="change_request",
+            target_id=cr.id,
+            extra={"title": cr.title, "review_notes": data.review_notes},
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_REJECTED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr.id,
+        ))
+    except Exception:
+        pass
+
     return _cr_to_response(cr)
 
 
@@ -792,6 +889,30 @@ async def close_change_request(
 
     await session.flush()
     await session.refresh(cr)
+
+    # HIA-75 C3: cr.closed webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_CLOSED,
+            target_type="change_request",
+            target_id=cr.id,
+            extra={"title": cr.title, "close_reason": data.close_reason},
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_CLOSED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr.id,
+        ))
+    except Exception:
+        pass
+
     return _cr_to_response(cr)
 
 
@@ -826,6 +947,35 @@ async def merge_change_request(
 
     await session.flush()
     await session.refresh(cr)
+
+    # HIA-75 C3: 发出 cr.merged webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_MERGED,
+            target_type="change_request",
+            target_id=cr.id,
+            extra={
+                "title": cr.title,
+                "baseline_version": cr.baseline_version,
+                "target_version": cr.target_version,
+                "merged_by": str(data.merged_by) if data.merged_by else None,
+            },
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_MERGED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr.id,
+        ))
+    except Exception:
+        pass  # 不阻断 CR 合并
+
     return _cr_to_response(cr)
 
 
@@ -1102,6 +1252,36 @@ async def create_comment(
     session.add(comment)
     await session.flush()
     await session.refresh(comment)
+
+    # HIA-75 C3: cr.comment_added webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.CR_COMMENT_ADDED,
+            target_type="change_request",
+            target_id=cr_id,
+            actor_id=data.author_id,
+            actor_name=data.author_name,
+            extra={
+                "comment_id": str(comment.id),
+                "parent_id": str(data.parent_id) if data.parent_id else None,
+                "body_preview": data.body[:200],
+            },
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.CR_COMMENT_ADDED,
+            project_id=cr.project_id,
+            payload=payload,
+            target_type="change_request",
+            target_id=cr_id,
+        ))
+    except Exception:
+        pass
+
     return _comment_to_response(comment)
 
 
@@ -1582,6 +1762,32 @@ async def publish_release(
     await session.flush()
     await session.refresh(release)
 
+    # HIA-75 C3: release.published webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.RELEASE_PUBLISHED,
+            target_type="release",
+            target_id=release.id,
+            extra={
+                "version": release.version,
+                "checksum": release.checksum,
+            },
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.RELEASE_PUBLISHED,
+            project_id=release.project_id,
+            payload=payload,
+            target_type="release",
+            target_id=release.id,
+        ))
+    except Exception:
+        pass
+
     return _release_to_response(release)
 
 
@@ -1677,6 +1883,34 @@ async def create_deployment(
 
     await session.flush()
     await session.refresh(deployment)
+
+    # HIA-75 C3: deployment.succeeded webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.DEPLOYMENT_SUCCEEDED,
+            target_type="deployment",
+            target_id=deployment.id,
+            extra={
+                "environment": data.environment,
+                "release_version": release.version,
+                "duration_ms": duration_ms,
+            },
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.DEPLOYMENT_SUCCEEDED,
+            project_id=project_id,
+            payload=payload,
+            target_type="deployment",
+            target_id=deployment.id,
+        ))
+    except Exception:
+        pass
+
     return _deployment_to_response(deployment)
 
 
@@ -1748,6 +1982,32 @@ async def rollback_deployment(
 
     await session.flush()
     await session.refresh(deployment)
+
+    # HIA-75 C3: deployment.rollback webhook
+    try:
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload = build_event_payload(
+            event_type=WebhookEventType.DEPLOYMENT_ROLLBACK,
+            target_type="deployment",
+            target_id=deployment.id,
+            extra={
+                "environment": deployment.environment,
+                "rolled_back_at": deployment.completed_at.isoformat() if deployment.completed_at else None,
+            },
+        )
+        asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.DEPLOYMENT_ROLLBACK,
+            project_id=deployment.project_id,
+            payload=payload,
+            target_type="deployment",
+            target_id=deployment.id,
+        ))
+    except Exception:
+        pass
 
     return _deployment_to_response(deployment)
 

@@ -33,6 +33,7 @@ from src.db.runtime import ActionRun, ActionRunStatus, ActionType, ActionTypeSta
 from src.api.auth import get_current_user, require_project_role, record_audit
 from src.db.project import Project
 from src.db.identity import Membership, Role
+from src.db.governance import AuditEventType
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/projects", tags=["Actions"])
@@ -208,7 +209,7 @@ async def create_action_type(
         runtime=data.runtime or "python",
         config=data.config,
         version=1,
-        created_by=user.id,
+        created_by=user.user.id if hasattr(user, "user") else None,
     )
     session.add(at)
     await session.flush()
@@ -216,12 +217,12 @@ async def create_action_type(
 
     await record_audit(
         session,
+        event_type=AuditEventType.CREATE,
+        principal=user,
         project_id=project_id,
-        actor_id=user.id,
-        action="action_type.create",
-        resource_type="action_type",
-        resource_id=str(at.id),
-        details={"name": at.name, "kind": at.kind},
+        target_type="action_type",
+        target_id=str(at.id),
+        after={"name": at.name, "kind": at.kind},
     )
 
     return _action_type_to_response(at)
@@ -303,12 +304,12 @@ async def update_action_type(
 
     await record_audit(
         session,
+        event_type=AuditEventType.UPDATE,
+        principal=user,
         project_id=project_id,
-        actor_id=user.id,
-        action="action_type.update",
-        resource_type="action_type",
-        resource_id=str(at.id),
-        details={"name": at.name},
+        target_type="action_type",
+        target_id=str(at.id),
+        after={"name": at.name},
     )
 
     return _action_type_to_response(at)
@@ -346,12 +347,12 @@ async def delete_action_type(
 
     await record_audit(
         session,
+        event_type=AuditEventType.DELETE,
+        principal=user,
         project_id=project_id,
-        actor_id=user.id,
-        action="action_type.delete",
-        resource_type="action_type",
-        resource_id=str(action_type_id),
-        details={"name": at.name},
+        target_type="action_type",
+        target_id=str(action_type_id),
+        after={"name": at.name},
     )
 
 
@@ -396,7 +397,7 @@ async def run_action(
         action_type_id=action_type_id,
         status=ActionRunStatus.PENDING,
         input_data=data.input_data or {},
-        triggered_by=str(user.id),
+        triggered_by=str(user.id if hasattr(user, "id") else user.user.id),
     )
     session.add(run)
     await session.flush()
@@ -407,12 +408,12 @@ async def run_action(
 
     await record_audit(
         session,
+        event_type=AuditEventType.CREATE,
+        principal=user,
         project_id=project_id,
-        actor_id=user.id,
-        action="action_run.create",
-        resource_type="action_run",
-        resource_id=str(run.id),
-        details={"action_type_id": str(action_type_id), "kind": at.kind},
+        target_type="action_run",
+        target_id=str(run.id),
+        after={"action_type_id": str(action_type_id), "kind": at.kind},
     )
 
     return _action_run_to_response(run)
@@ -627,12 +628,12 @@ async def cancel_action_run(
 
     await record_audit(
         session,
+        event_type=AuditEventType.UPDATE,
+        principal=user,
         project_id=ar.project_id,
-        actor_id=user.id,
-        action="action_run.cancel",
-        resource_type="action_run",
-        resource_id=str(ar.id),
-        details={"previous_status": str(ar.status.value)},
+        target_type="action_run",
+        target_id=str(ar.id),
+        after={"previous_status": str(ar.status.value)},
     )
 
     return _action_run_to_response(ar)

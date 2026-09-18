@@ -415,6 +415,33 @@ async def create_object(
             after=after,
         )
         await session.commit()
+
+        # HIA-75 C3: object.updated webhook (upsert update path)
+        try:
+            import asyncio as _asyncio
+            from src.services.webhook_dispatcher import (
+                dispatch_webhook,
+                build_event_payload,
+                WebhookEventType,
+            )
+            payload_wb = build_event_payload(
+                event_type=WebhookEventType.OBJECT_UPDATED,
+                target_type="object",
+                target_id=existing.id,
+                actor_id=principal.user_id if principal else None,
+                actor_name=getattr(principal, 'name', None),
+                extra={"before": before, "after": after},
+            )
+            _asyncio.create_task(dispatch_webhook(
+                event_type=WebhookEventType.OBJECT_UPDATED,
+                project_id=project_id,
+                payload=payload_wb,
+                target_type="object",
+                target_id=existing.id,
+            ))
+        except Exception:
+            pass
+
         return _obj_to_response(existing)
 
     obj = ObjModel(
@@ -445,6 +472,37 @@ async def create_object(
         after={"id": str(obj.id), "name": obj.name},
     )
     await session.commit()
+
+    # HIA-75 C3: object.created webhook
+    try:
+        import asyncio as _asyncio
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload_wb = build_event_payload(
+            event_type=WebhookEventType.OBJECT_CREATED,
+            target_type="object",
+            target_id=obj.id,
+            actor_id=principal.user_id if principal else None,
+            actor_name=getattr(principal, 'name', None),
+            extra={
+                "name": obj.name,
+                "ontology_class_iri": obj.ontology_class_iri,
+                "identity_key": obj.identity_key,
+            },
+        )
+        _asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.OBJECT_CREATED,
+            project_id=project_id,
+            payload=payload_wb,
+            target_type="object",
+            target_id=obj.id,
+        ))
+    except Exception:
+        pass
+
     return _obj_to_response(obj)
 
 
@@ -559,6 +617,33 @@ async def update_object(
         after=after,
     )
     await session.commit()
+
+    # HIA-75 C3: object.updated webhook
+    try:
+        import asyncio as _asyncio
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload_wb = build_event_payload(
+            event_type=WebhookEventType.OBJECT_UPDATED,
+            target_type="object",
+            target_id=obj.id,
+            actor_id=principal.user_id if principal else None,
+            actor_name=getattr(principal, 'name', None),
+            extra={"before": before, "after": after},
+        )
+        _asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.OBJECT_UPDATED,
+            project_id=project_id,
+            payload=payload_wb,
+            target_type="object",
+            target_id=obj.id,
+        ))
+    except Exception:
+        pass
+
     return _obj_to_response(obj)
 
 
@@ -594,6 +679,32 @@ async def delete_object(
         after={"hard_delete": not soft},
     )
     await session.commit()
+
+    # HIA-75 C3: object.deleted webhook
+    try:
+        import asyncio as _asyncio
+        from src.services.webhook_dispatcher import (
+            dispatch_webhook,
+            build_event_payload,
+            WebhookEventType,
+        )
+        payload_wb = build_event_payload(
+            event_type=WebhookEventType.OBJECT_DELETED,
+            target_type="object",
+            target_id=object_id,
+            actor_id=principal.user_id if principal else None,
+            actor_name=getattr(principal, 'name', None),
+            extra={"hard_delete": not soft, "name": obj.name if not soft else None},
+        )
+        _asyncio.create_task(dispatch_webhook(
+            event_type=WebhookEventType.OBJECT_DELETED,
+            project_id=project_id,
+            payload=payload_wb,
+            target_type="object",
+            target_id=object_id,
+        ))
+    except Exception:
+        pass
 
 
 @router.post(
