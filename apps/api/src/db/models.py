@@ -34,7 +34,7 @@ from .release import (
     PreflightReport,
 )
 from .governance import PluginInstallation, AuditEvent, DriftProposal, HealthSnapshot
-from .identity import User, Membership, GlobalRole, Role, has_role
+from .identity import User, Membership, GlobalRole, Role, has_role, ApiKey
 from .connector import Connector, ConnectorType, ConnectorStatus
 
 __all__ = [
@@ -107,6 +107,7 @@ __all__ = [
     "GlobalRole",
     "Role",
     "has_role",
+    "ApiKey",  # HIA-64 B1
     # Connector 框架（HIA-71）
     "Connector",
     "ConnectorType",

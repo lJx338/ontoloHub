@@ -109,13 +109,29 @@ class AISettings(BaseSettings):
 
 
 class SecuritySettings(BaseSettings):
-    """安全配置"""
+    """安全配置（HIA-64 B1 — JWT + API Key）。"""
+
+    # 用于 Fernet 对称加密 / 一般 secret 派生。
     secret_key: str = Field(default="change-me-in-production")
+    # JWT 用单独的密钥（默认派生自 secret_key，但生产环境可独立配置）。
+    jwt_secret: str = Field(default="")
+    jwt_algorithm: str = Field(default="HS256")
+    jwt_access_ttl_seconds: int = Field(default=60 * 60, ge=60)  # 1h
+    jwt_refresh_ttl_seconds: int = Field(default=60 * 60 * 24 * 7, ge=60)  # 7d
+    # bcrypt rounds（用于密码哈希；越高越慢，默认 12 是合理折中）
+    bcrypt_rounds: int = Field(default=12, ge=4, le=16)
+    # API Key 配置
+    api_key_prefix: str = Field(default="ont_")
+
     allowed_origins: list[str] = Field(
         default=["http://localhost:3000", "http://localhost:8080"]
     )
 
     model_config = SettingsConfigDict(env_prefix="")
+
+    def effective_jwt_secret(self) -> str:
+        """生产环境未设 jwt_secret 时退到 secret_key；空字符串也允许（开发）。"""
+        return self.jwt_secret or f"{self.secret_key}-jwt"
 
 
 class UploadSettings(BaseSettings):
