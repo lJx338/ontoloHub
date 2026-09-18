@@ -1252,8 +1252,10 @@ async def update_release(
 
     update_data = data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
-        if field == "tags" and release.artifacts:
-            release.artifacts["tags"] = value
+        if field == "tags":
+            # tags 存在 artifacts JSON 里；如果 artifacts 还没初始化就创建空 dict
+            current = release.artifacts or {}
+            release.artifacts = {**current, "tags": value}
         else:
             setattr(release, field, value)
 
@@ -1397,7 +1399,6 @@ async def list_project_deployments(
         select(Deployment)
         .join(Release)
         .where(Release.project_id == project_id)
-        .options(selectinload(Deployment.release))
     )
 
     if status is not None:
@@ -1561,6 +1562,7 @@ class UseCaseBundleCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
     version: str = Field(..., min_length=1, max_length=50)
+    release_id: uuid.UUID
     use_case_ids: Optional[list[uuid.UUID]] = None
     ontology_version_id: Optional[uuid.UUID] = None
     mapping_version_id: Optional[uuid.UUID] = None
@@ -1643,9 +1645,13 @@ async def create_use_case_bundle(
 ) -> UseCaseBundleResponse:
     """创建用例包。"""
     await _verify_project_exists(session, project_id)
+    release = await _verify_release_exists(session, data.release_id)
+    if release.project_id != project_id:
+        raise HTTPException(status_code=400, detail="release 不属于该项目")
 
     bundle = UseCaseBundle(
         project_id=project_id,
+        release_id=data.release_id,
         name=data.name,
         description=data.description,
         version=data.version,
