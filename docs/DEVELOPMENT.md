@@ -1965,3 +1965,522 @@ async with session_factory() as s:
     await s.commit()  # ← 不要 flush
 ```
 
+---
+
+## 22. Webhook / Trigger 集成（HIA-75 / C3）
+
+Webhook 分两路：**Out**（主动发到外部 URL）和 **In**（外部 POST 进来触发）。
+两路都用 `trigger_config` + `action_type_id` 关联 ActionRun。
+
+### 22.1 模块边界
+
+- `apps/api/src/db/webhook.py` — `WebhookConfig` / `WebhookDelivery` / `TriggerConfig` ORM
+- `apps/api/src/services/webhook_dispatcher.py` — HMAC 签名 + 重试 + 内嵌处理
+- `apps/api/src/api/webhooks.py` — CRUD + 内嵌 webhook 接收端点
+- `apps/api/alembic/versions/2026_09_18_0007_webhook_trigger.py` — schema
+
+### 22.2 Out 端：HMAC-SHA256 + 指数退避重试
+
+每次发 webhook 构造签名头：
+
+```python
+timestamp = str(int(datetime.now(timezone.utc).timestamp()))
+signed_payload = f"{timestamp}.{body}"
+signature = hmac.new(secret.encode(), signed_payload.encode(), hashlib.sha256).hexdigest()
+headers = {
+    "Content-Type": "application/json",
+    "X-OntoloHub-Signature": f"sha256={signature}",
+    "X-OntoloHub-Timestamp": timestamp,
+    "User-Agent": "OntoloHub-Webhook/1.0",
+}
+```
+
+**接收端校验**：用 `replay-attack-safe` 顺序：
+1. 检查 `X-OntoloHub-Timestamp` 在 ±5 分钟内（防重放）
+2. 重算 `HMAC(secret, "{timestamp}.{body}")` 与 `X-OntoloHub-Signature` 比对
+3. `hmac.compare_digest` 防 timing attack
+
+### 22.3 重试策略 + 状态机
+
+`WebhookDelivery.status` 状态机：
+
+```
+PENDING ──HTTP 2xx──► SUCCESS (终态)
+   │
+   ├──HTTP 非 2xx/timeout──► RETRYING ──成功──► SUCCESS
+   │                              │
+   │                              └─attempt < retry_count──► RETRYING
+   │
+   └──attempt == retry_count──► DROPPED (终态)
+```
+
+退避：`asyncio.sleep(retry_delay * (2 ** (attempt - 1)))` — 1min / 2min / 4min。
+
+### 22.4 SQLite 存 UUID 是 32 字符 hex（无 dash）— 用 `.hex` 转换
+
+**症状**：`webhook_dispatcher.py` 用 raw SQL 写 `trigger_configs` 时，
+`UUID("...")` 直接传给 `:id` 绑定变量报 `ValueError: badly formed hexadecimal UUID string`。
+
+**原因**：SQLAlchemy 在 `Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))` 上
+**自动**用 `.hex` 存储；如果你绕过 ORM 用 `session.execute(_text("... WHERE id = :id"), {"id": some_uuid})`，
+aiosqlite 不会自动转换，传 `uuid.UUID` 对象会报类型错，传 str-with-dash 也会因为长度不对报 `badly formed`。
+
+**规避**：
+
+```python
+# ✅ 用 .hex 拿到 32 字符无 dash 的字符串
+session.execute(
+    _text("INSERT INTO trigger_configs (id, ...) VALUES (:id, ...)"),
+    {"id": matched_trigger_id.hex, ...}
+)
+
+# 读回来时反过来
+matched_trigger_id = uuid.UUID(row[0])  # row[0] 是 32 字符 hex
+```
+
+PG 上不存在这个问题（用 `uuid` 类型，自动接 `UUID` 对象）。SQLite + raw SQL
+混用时才需要 `.hex` 转换。
+
+### 22.5 内嵌 webhook 处理用 sync session 而非 async
+
+**症状**：`POST /api/webhooks/in/{token}` 测试里第一次触发就报
+`TriggerConfig token not found`，但其实 trigger 刚刚在同一个 HTTP 响应里创建成功。
+
+**原因**：FastAPI 异步 handler 的事务还没 commit（要等 `Depends(get_session)` 的
+get_session generator 退出），下游 `process_inbound_webhook` 已经起了一个
+**新的 async session**，看不到未提交的 INSERT。
+
+**规避**：内嵌 webhook 处理函数（`process_inbound_webhook`）**用 sync session**
+（`sync_session_factory`）而不是 async —— sync session 走的是另一个连接池，
+强制等当前 async 事务提交后才会发新查询。
+
+```python
+from src.db.connection import sync_session_factory
+from sqlalchemy import text as _text
+
+with sync_session_factory() as session:
+    row = session.execute(
+        _text("SELECT id, action_type_id, project_id, input_template "
+              "FROM trigger_configs "
+              "WHERE trigger_type = 'INBOUND_WEBHOOK' "
+              "  AND json_extract(trigger_config, '$.token') = :token"),
+        {"token": token},
+    ).first()
+```
+
+**反例**（不要照抄）：
+
+```python
+# ❌ async session 看到的是 isolation level 内的快照，
+# 触发器还没 commit 之前看不到
+async with async_session_factory() as s:
+    row = (await s.execute(select(TriggerConfig).where(...))).first()
+```
+
+### 22.6 Trigger input_template：`{{webhook.payload.xxx}}` 简单替换
+
+`_apply_template(template, context)` 是递归 dict / list 替换，只识别
+`{{var.path}}` 这种字符串模板；不识别分支 / 循环 / 表达式。
+
+```python
+# 示例
+input_template = {
+    "customer_email": "{{webhook.payload.email}}",
+    "metadata": {
+        "received_at": "{{webhook.received_at}}",
+        "headers": {
+            "user_agent": "{{webhook.headers.user-agent}}"
+        }
+    }
+}
+```
+
+**支持的上下文变量**（按 trigger 类型）：
+
+- **inbound_webhook**：`{{webhook.headers.xxx}}` / `{{webhook.payload.xxx}}` / `{{webhook.received_at}}`
+- **schedule**：`{{schedule.fired_at}}` / `{{schedule.cron}}`
+- **object_change**（计划）：`{{object.before}}` / `{{object.after}}` / `{{object.event_type}}`
+
+**未匹配的处理**：保留原字符串 `{{unknown.var}}` 不替换（不报错）；要业务侧
+校验时再用 `{{var}}` 检查结果是否含 `{`。
+
+### 22.7 cron 解析只支持基础 5 字段语法
+
+`_cron_matches` 实现简化的 cron 匹配，**只支持**：
+
+- `*` — 通配
+- `*/N` — 每 N 单位
+- 逗号分隔的列表 `1,3,5`
+- 精确值 `5`
+
+**不支持**：范围 `1-5`、L / W / # 扩展、时区处理、秒级 cron（仅 5 字段：`分 时 日 月 周`）。
+**周字段**：Sunday = 0（不是 7）。
+
+```python
+# 支持
+"*/5 * * * *"     # 每 5 分钟
+"0 9 * * 1-5"     # ❌ 不支持范围 — 当前实现会判错
+"0 9 * * 1,3,5"   # ✅ 周一周三周五 9 点
+```
+
+需要高级 cron 时换 apscheduler / `croniter` 库。
+
+### 22.8 Inbound webhook 接收端点无 auth — token 在 URL 里
+
+**设计**：`POST /api/webhooks/in/{token}` 是**公开端点**，没 `Authorization` header。
+鉴权完全靠 URL 中的 token：
+
+```python
+@trigger_router.post("/api/webhooks/in/{token}")
+async def receive_webhook(token: str, request: Request):
+    # 不走 require_role / get_current_user — 外部系统不会发这些 header
+    success, error, trigger_id = await process_inbound_webhook(token, payload, headers)
+```
+
+**安全要求**：
+
+- Token 用 `secrets.token_urlsafe(32)`（256 bit 熵），不要可枚举
+- token 泄漏 = 攻击者可触发你的 Function；考虑 rate limit + IP allowlist
+- 配置 trigger 时默认生成 token，用户也可指定（但**不要**复用旧 token）
+- 收到 404 时**统一**返 `"Token not found or trigger not active"`，
+不区分"token 不存在"和"trigger 暂停" — 防 enumeration
+
+### 22.9 UUID(as_uuid=True) 处理器在 dispatcher 必须先转
+
+**症状**：`WebhookConfig.project_id` 在 ORM 里是 `UUID(as_uuid=True)`，dispatcher
+用 `select(WebhookConfig).where(WebhookConfig.project_id == project_id)` 查
+的时候，传字符串 `project_id` 报 `ValueError`。
+
+**原因**：`UUID(as_uuid=True)` 列的处理器对绑定的字符串调用 `.hex`；如果传
+`uuid.UUID(...)` 对象本身，SQLAlchemy 会试图 `.hex` 一个 UUID 实例（UUID 没
+`hex`，但有 `.hex` 属性 → 返回 32 字符 hex），所以传 UUID 对象也能跑；如果
+传**带 dash 的字符串**，SQLAlchemy 会先解析再 .hex → 也 OK。
+
+**真正出错的是 SQLAlchemy 2.0 的 strict 类型检查** — 传 `str` 而不是 `UUID` 会抛
+`InvalidRequestError: expected UUID, got str`。
+
+**规避**：在 dispatcher 入口统一转：
+
+```python
+if isinstance(project_id, str):
+    project_id = uuid.UUID(project_id)
+```
+
+### 22.10 测试用例：清理未完成的 delivery task
+
+**症状**：`test_webhook_trigger.py` 跑完测试后，控制台报 `RuntimeError: Event loop is closed`
+或者 task `was destroyed but it is pending!`。
+
+**原因**：`dispatch_webhook` 用 `asyncio.create_task(_deliver_with_retry(...))` fire-and-forget，
+测试 fixture 退出后 ASGITransport 关闭 event loop，但 task 还在 sleep / retry 中。
+
+**规避**（测试 fixture 里）：
+
+```python
+@pytest_asyncio.fixture
+async def isolated_app(...):
+    async with AsyncClient(...) as client:
+        yield client
+    # 等待所有 webhook delivery task 结束
+    pending = [t for t in asyncio.all_tasks() if not t.done() and "_deliver_with_retry" in str(t)]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+```
+
+或者在 production webhook URL 用 `[http://localhost:0/never-resolve]` 等极快失败的
+URL，避免测试卡在 sleep / retry 循环。
+
+---
+
+## 23. Function 沙箱执行器（HIA-78 / C2）
+
+HIA-78 实现 Python / JS Function 的 subprocess 沙箱执行。真正的安全边界是
+**subprocess + timeout + (Unix) rlimit**；AST 限制**不做**（RestrictedPython
+会引入过多兼容性问题，收益不抵复杂度）。
+
+### 23.1 模块边界
+
+- `apps/api/src/runtime/sandbox.py` — `execute_python()` / `execute_javascript()`
+- `apps/api/src/runtime/result.py` — `SandboxResult` / `SandboxError`
+- 子进程通过 stdin/stdout 协议与主进程通信（见 §23.5）
+
+### 23.2 资源限制矩阵
+
+| 限制项 | Unix 实现 | Windows 实现 |
+|---|---|---|
+| Wall-clock timeout | `subprocess.run(timeout=N)` | `subprocess.run(timeout=N)` |
+| CPU time | `resource.RLIMIT_CPU` | ❌（靠 timeout 兜底） |
+| Memory (地址空间) | `resource.RLIMIT_AS` | ❌（靠 timeout 兜底） |
+| 文件描述符 | `resource.RLIMIT_NOFILE` | ❌ |
+| 输出大小 | stdout/stderr 截断 1MB | stdout/stderr 截断 1MB |
+| 阻止 fork | `prctl(PR_SET_NO_NEW_PRIVS=38, 1)` | ❌ |
+
+**Windows 上的妥协**：靠 timeout + 输出截断做兜底；用户可以写死循环 / 占满内存
+但 30s 后必被 kill。本机验证足够，生产 Linux 部署才完整生效。
+
+### 23.3 编译期只做 `ast.parse`，不做 RestrictedPython
+
+```python
+def validate_python_source(code: str) -> None:
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        raise SandboxError(kind="syntax", message=f"Syntax error: {exc.msg}")
+```
+
+**为什么不限制 import / getattr / `_` 开头属性**：
+
+- RestrictedPython 会强制覆盖 `__builtins__`，破坏 `print`、`len`、`json.dumps`
+  这些常用内置；用户 Function 90% 都不安全也不需要。
+- 真隔离靠 subprocess — 子进程崩了主进程没事，timeout 强制 kill。
+- 业务上要让用户能 `import json` / `import requests` 调外部 API。
+
+**真正需要隔离的**（如果出现）：
+
+- 文件系统访问 — 加 chroot / docker
+- 网络访问 — 加 network namespace
+- 资源配额持久生效 — Linux cgroup
+
+### 23.4 输入输出协议
+
+**主进程 → 子进程（stdin）**：
+
+```json
+{"input_data": {...}, "secrets": {...}, "timeout_s": 30}
+```
+
+**子进程 → 主进程（stdout）**：
+
+```
+[user print output, free-form]
+<<<RESULT>>>
+{"final": "result value", ...}
+<<<END>>>
+```
+
+**为什么用 marker 而不是只读 stdout 最后一行**：
+
+- 用户 `print("...")` 可能输出任意内容，最后一行不可靠
+- marker 让结果边界清晰；主进程抓 `<<<RESULT>>>...<<<END>>>` 区间
+- 用户代码最后必须赋值给 `result` 变量；runner 模板负责 `json.dumps(globals_dict["result"])`
+
+### 23.5 用户代码嵌入 runner 模板用 `repr` 双层转义
+
+```python
+def _build_runner_script(user_code: str) -> str:
+    embedded = repr(user_code)  # 'a = 1\\nresult = a + 1'
+    return _PYTHON_RUNNER.replace("USER_CODE_PLACEHOLDER", embedded)
+```
+
+`repr()` 把字符串转成合法 Python 字面量 —— 处理换行 / 引号 / 反斜杠不踩坑。
+**不要**用 f-string 拼接或 `"..." + code + "..."`，多行代码 + 单引号
+会立刻破坏语法。
+
+### 23.6 Node.js 24 在 Windows 上 stdin 触发 CSPRNG 断言
+
+**症状**：`execute_javascript()` 在 Windows + Node 24 上跑（哪怕最简单的代码）：
+```
+internal/crypto/random.js: ... Error: ... Failed to generate bytes
+```
+
+**原因**：Node 24 启动时 stdin pipe 触发 CSPRNG 初始化；某些 Windows 环境
+（特别是 git-bash / 容器内）默认 stdin 不可读。
+
+**规避**：`stdin=subprocess.DEVNULL` + 把 input 写到**临时文件**：
+
+```python
+input_fd, input_path = tempfile.mkstemp(suffix=".json", prefix="sandbox_js_in_")
+with os.fdopen(input_fd, "w") as f:
+    f.write(json.dumps({"input_data": input_data or {}}))
+
+sandbox_env["__HIA78_INPUT_PATH__"] = input_path
+
+proc = subprocess.run(
+    ["node", wrapper_path],
+    capture_output=True,
+    timeout=timeout,
+    stdin=subprocess.DEVNULL,  # ← 关键
+    env=sandbox_env,
+)
+```
+
+JS wrapper 脚本从 `process.env.__HIA78_INPUT_PATH__` 读 input。
+
+### 23.7 沙箱子进程环境变量白名单
+
+```python
+def _sandbox_env() -> dict:
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "USER": os.environ.get("USER", ""),
+        "SYSTEMROOT": os.environ.get("SYSTEMROOT", "C:\\Windows"),  # Windows 必须
+        "TEMP": os.environ.get("TEMP", ""),
+        "TMP": os.environ.get("TMP", ""),
+        "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "en_US.UTF-8"),
+        "PYTHONPATH": "",     # 禁掉外部包路径
+        "HIA78_SANDBOX": "1", # 标识
+    }
+```
+
+**关键点**：
+
+- **不**传 `SECRET_KEY` / `DATABASE_URL` / `JWT_SECRET` 等凭证到子进程
+- Windows 上 `SYSTEMROOT` 必传，否则很多 API（包括 subprocess）失败
+- `PYTHONPATH=""` 强制子进程用系统默认 Python 路径，不被宿主污染
+
+### 23.8 用户代码失败的 3 类异常
+
+```python
+# 1. 编译失败（语法错）
+SandboxError(kind="syntax", message="Syntax error: ...")
+
+# 2. 运行时异常（exec 阶段）
+#    子进程 sys.exit(1) 写 traceback 到 stderr，主进程原样抛回
+SandboxResult(exit_code=1, stderr="Traceback ...\nValueError: ...", ...)
+
+# 3. 超时
+SandboxError(kind="timeout", message=f"Execution exceeded {timeout}s timeout")
+```
+
+**ActionRun.status 映射**：
+
+- 1 / 2 → `ActionRunStatus.FAILED`（业务失败，error 字段记 stderr）
+- 3 → `ActionRunStatus.FAILED`，error 写 `timeout_ms={duration_ms}` 便于排查
+
+### 23.9 ActionRun.input_data JSON 序列化要稳定
+
+**症状**：函数 sandbox 拿到的 `input_data` 是 dict 但字段顺序变了，
+函数内 `assert input_data == {"a": 1, "b": 2}` 失败。
+
+**原因**：SQLAlchemy 把 `Mapped[dict] = mapped_column(JSON)` 的 JSON 列
+反序列化时按入库时的 JSON 字符串还原；如果入库是 `json.dumps(data, sort_keys=False)`，
+反序列化后字段顺序就是入库顺序。
+
+**规避**：写入 ActionRun 时统一 `json.dumps(input_data, sort_keys=True)`，或
+让用户函数按 key 取值而不是 assert dict literal。
+
+### 23.10 sandbox 测试要跳 Windows-only 的子进程路径
+
+**症状**：CI 跑 sandbox 测试全过，本地 Windows 跑 `subprocess.run([sys.executable, tmp_path], ...)`
+挂起或超时。
+
+**原因**：本机 Python 安装了某些包带 debugger（pydevd）会卡 subprocess。
+
+**规避**：测试前 `pip uninstall pydevd pydevd-pycharm` 或者用
+`subprocess.run([sys.executable, "-S", tmp_path], ...)`（`-S` 不加载 site）。
+
+---
+
+## 24. 通用避坑（跨任务总结）
+
+### 24.1 UUID(as_uuid=True) 在 SQLite 上的存储行为
+
+`Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))` 在 SQLite 里
+**默认存 32 字符 hex（无 dash）**；UUID 类型本身变成 `CHAR(32)`。这一点
+和 PostgreSQL `uuid` 类型存 `xxxxxxxx-xxxx-...` 字符串**不一致**。
+
+**踩坑位置**：
+
+1. **Alembic 迁移**：SQLite 表 schema 里看到的是 `CHAR(32)`，迁移到 PG
+   时要 `op.alter_column` 改类型；或者一开始就不要手动写 schema 让 autogenerate 来。
+2. **Raw SQL**：绕过 ORM 用 `session.execute(_text(...))` 时，绑定
+   `uuid.UUID(...)` 对象 — aiosqlite 上**不会**自动 `.hex`，必须手动 `id.hex`。
+3. **跨 dialect 测试**：PG 测试和 SQLite 测试都跑 — 任意一边 fail 都是
+   dialect 差异问题。
+
+### 24.2 HTTP 端点的 tag 顺序与 OpenAPI
+
+FastAPI 按**装饰器注册顺序**生成 OpenAPI `paths` 字典，顺序与 `tags` 显示
+无关 — tags 是按字母排序聚合。如果想让 `/api/webhooks/in/{token}` 出现在
+"Triggers" 而非 "Webhooks" tag 下，**必须**用不同的 `APIRouter` 实例
+（`trigger_router = APIRouter(tags=["Triggers"])`），不要想靠 `@router.post`
+覆盖 tag。
+
+### 24.3 测试用 fake URL 触发 webhook，端口要空闲
+
+**症状**：`test_webhook_dispatch` 用 `http://127.0.0.1:9999/hook` 测试，
+本机端口被占用，httpx 报 `ConnectError`，但测试还跑通了（因为 dispatcher
+catch 后只记 `failed_deliveries`，不影响主流程）。
+
+**规避**：测试里启动一个真正的 aiohttp / uvicorn mock server：
+
+```python
+import aiohttp
+from aiohttp import web
+
+received_payloads = []
+
+async def hook(request):
+    payload = await request.json()
+    received_payloads.append(payload)
+    return web.Response(text="ok")
+
+app = web.Application()
+app.router.add_post("/hook", hook)
+
+@pytest_asyncio.fixture
+async def webhook_server():
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)  # 端口 0 = 让系统分配
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    yield f"http://127.0.0.1:{port}/hook"
+    await runner.cleanup()
+```
+
+不要 hardcode 固定端口；本机 CI / 多测试并行跑都会冲突。
+
+### 24.4 异步 fire-and-forget task 要保留 ref 到测试结束
+
+```python
+# ❌ task 失去引用，GC 可能在中间干掉
+asyncio.create_task(_deliver_with_retry(...))
+
+# ✅ 保留 ref（模块级 list 或 instance attribute）
+_DISPATCH_TASKS: set[asyncio.Task] = set()
+
+def fire_delivery(...):
+    task = asyncio.create_task(_deliver_with_retry(...))
+    _DISPATCH_TASKS.add(task)
+    task.add_done_callback(_DISPATCH_TASKS.discard)
+```
+
+production OK（loop 一直跑），测试会爆 `Task was destroyed but it is pending`。
+HIA-75 webhook dispatcher 已用 `await asyncio.gather(*tasks, return_exceptions=True)`
+但 fire-and-forget 路径上仍要保留 ref 防止 GC。
+
+### 24.5 SQLite 上 JSON 列查询的代价
+
+`WHERE json_extract(trigger_config, '$.token') = :token` 在 SQLite 上
+**全表扫描**（json path 上无索引）；生产 PG 上可加 GIN 索引。
+
+如果 trigger_configs 表会很大（>10K 行），dispatcher 入口要加 LRU 缓存：
+
+```python
+from functools import lru_cache
+import asyncio
+
+@lru_cache(maxsize=1024)
+def _cached_token_lookup(token: str) -> Optional[str]:
+    # 注意：sync 函数不能直接 await；改成 async + 自建 cache
+    ...
+```
+
+实际生产方案：dispatcher 启动时把 `token → trigger_id` 全量加载到内存 dict，
+token 增删时同步更新内存 map（监听 webhooks API 的 INSERT/DELETE）。
+
+### 24.6 Branch 命名：Linear 卡和 git 分支名必须严格匹配
+
+**症状**：上一步 HIA-78 提交到 `liaxiao23/hia-78-c2-...` 分支后，
+下一个任务 HIA-75 继续在同一分支写代码，commit 提交时分支名仍是 HIA-78。
+结果 HIA-75 的 commit 落在 HIA-78 分支上，git blame / log 全部串了。
+
+**规避**：每接新卡先 `git checkout -b liaxiao23/hia-XX-<name> <base>`，
+**base** 用上一个已 Done 的分支 HEAD（不一定是 main — 可能是栈式分支）。
+不要 `git checkout -b ... main` 然后 rebase —— 如果中间有别人的提交会冲突。
+
+**校验**：`git log --oneline | grep "HIA-75"` 看 commit 是否在正确的分支上。
+
