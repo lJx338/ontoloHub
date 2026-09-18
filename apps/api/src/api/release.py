@@ -1480,9 +1480,7 @@ async def get_deployment(
 ) -> DeploymentResponse:
     """获取部署详情。"""
     result = await session.execute(
-        select(Deployment)
-        .where(Deployment.id == deployment_id)
-        .options(selectinload(Deployment.release))
+        select(Deployment).where(Deployment.id == deployment_id)
     )
     deployment = result.scalar_one_or_none()
 
@@ -1500,9 +1498,7 @@ async def update_deployment(
 ) -> DeploymentResponse:
     """更新部署状态。"""
     result = await session.execute(
-        select(Deployment)
-        .where(Deployment.id == deployment_id)
-        .options(selectinload(Deployment.release))
+        select(Deployment).where(Deployment.id == deployment_id)
     )
     deployment = result.scalar_one_or_none()
 
@@ -1526,9 +1522,7 @@ async def rollback_deployment(
 ) -> DeploymentResponse:
     """回滚部署。"""
     result = await session.execute(
-        select(Deployment)
-        .where(Deployment.id == deployment_id)
-        .options(selectinload(Deployment.release))
+        select(Deployment).where(Deployment.id == deployment_id)
     )
     deployment = result.scalar_one_or_none()
 
