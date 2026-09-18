@@ -1,0 +1,8 @@
+order_id,customer_email,total,placed_at
+O1001,alice@acme.test,249.50,2026-03-10
+O1002,bob@acme.test,89.00,2026-03-12
+O1003,alice@acme.test,512.75,2026-03-14
+O1004,carol@acme.test,1500.00,2026-03-20
+O1005,david@acme.test,45.25,2026-04-01
+O1006,eve@acme.test,330.00,2026-04-05
+O1007,bob@acme.test,78.99,2026-04-09

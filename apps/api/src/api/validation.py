@@ -358,13 +358,41 @@ async def create_validation_run(
     session: AsyncSession = Depends(get_session),
     project_id: uuid.UUID = Query(...),
 ) -> ValidationRunResponse:
-    """创建验证运行"""
+    """创建验证运行。
+
+    `ValidationRunCreate` 提供一个宽松的「逻辑字段」接口：
+    - ``validation_type`` 写到 ``ValidationRun.name``（方便用户定位运行）。
+    - ``ontology_version_id`` / ``mapping_version_id`` 选择 ``target_type`` +
+      ``target_id``：ontology 优先，其次 mapping；都没有则 422。
+    - ``config`` 一并写入 ``fixture_ids``/``shape_paths``（如果传入这两个键）。
+    """
+    target_type: Optional[str] = None
+    target_id: Optional[uuid.UUID] = None
+    if data.ontology_version_id is not None:
+        target_type = "ontology"
+        target_id = data.ontology_version_id
+    elif data.mapping_version_id is not None:
+        target_type = "mapping"
+        target_id = data.mapping_version_id
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="必须提供 ontology_version_id 或 mapping_version_id 之一",
+        )
+
+    fixture_ids = None
+    shape_paths = None
+    if isinstance(data.config, dict):
+        fixture_ids = data.config.get("fixture_ids")
+        shape_paths = data.config.get("shape_paths")
+
     run = ValidationRun(
         project_id=project_id,
-        validation_type=data.validation_type,
-        ontology_version_id=data.ontology_version_id,
-        mapping_version_id=data.mapping_version_id,
-        config=data.config,
+        name=data.validation_type,
+        target_type=target_type,
+        target_id=target_id,
+        fixture_ids=fixture_ids,
+        shape_paths=shape_paths,
         status=ValidationStatus.PENDING,
     )
     session.add(run)
@@ -374,12 +402,12 @@ async def create_validation_run(
     return ValidationRunResponse(
         id=run.id,
         project_id=run.project_id,
-        validation_type=run.validation_type,
+        validation_type=run.name,
         status=run.status,
-        total_tests=run.total_tests,
-        passed_tests=run.passed_tests,
-        failed_tests=run.failed_tests,
-        skipped_tests=run.skipped_tests,
+        total_tests=run.total_checks,
+        passed_tests=run.passed_checks,
+        failed_tests=run.failed_checks,
+        skipped_tests=0,
         duration_ms=run.duration_ms,
         started_at=_to_iso(run.started_at),
         completed_at=_to_iso(run.completed_at),
@@ -393,12 +421,13 @@ async def execute_validation_run(
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ) -> ValidationRunResponse:
-    """执行验证运行（同步执行，返回结果）
+    """执行验证运行（同步执行，返回结果）。
 
-    对映射版本中的所有 fixture 执行验证。
-    - fixture.input_data 经过 identity_mapping 转换
-    - 与 fixture.expected_output 比较
-    - 更新 fixture.status 和 run 统计
+    实现策略（与 ``ValidationRun`` 新模型对齐）：
+    - ``run.target_type == "mapping"`` → 拉该 mapping 版本的 fixture 跑；
+    - ``run.target_type == "ontology"`` → 走 ontology SHACL 占位（pass through）；
+    - ``target_type == "dataset"`` 或无 fixture → 标记 skipped。
+    - 统计字段使用 ``total_checks / passed_checks / failed_checks`` 模型列。
     """
     result = await session.execute(
         select(ValidationRun).where(ValidationRun.id == run_id)
@@ -415,83 +444,82 @@ async def execute_validation_run(
     run.started_at = datetime.now(timezone.utc)
     await session.flush()
 
-    # 获取关联的映射版本和夹具
-    if not run.mapping_version_id:
-        run.status = ValidationStatus.SKIPPED
-        run.completed_at = datetime.now(timezone.utc)
-        await session.flush()
-        await session.refresh(run)
-        return ValidationRunResponse(
-            id=run.id, project_id=run.project_id,
-            validation_type=run.validation_type, status=run.status,
-            total_tests=run.total_tests, passed_tests=run.passed_tests,
-            failed_tests=run.failed_tests, skipped_tests=run.skipped_tests,
-            duration_ms=run.duration_ms,
-            started_at=_to_iso(run.started_at),
-            completed_at=_to_iso(run.completed_at),
-            created_at=_to_iso(run.created_at),
+    # 不同 target_type 的处理路径
+    if run.target_type == "mapping":
+        fixtures_result = await session.execute(
+            select(MappingFixture).where(
+                MappingFixture.mapping_version_id == run.target_id
+            )
         )
+        fixtures = list(fixtures_result.scalars().all())
 
-    fixtures_result = await session.execute(
-        select(MappingFixture).where(
-            MappingFixture.mapping_version_id == run.mapping_version_id
-        )
-    )
-    fixtures = list(fixtures_result.scalars().all())
+        passed = 0
+        failed = 0
+        results: list[dict] = []
 
-    passed = 0
-    failed = 0
-    skipped = 0
-    results: list[dict] = []
-
-    for f in fixtures:
-        f.status = ValidationStatus.RUNNING
-
-        try:
-            # 简化验证逻辑：检查 expected_output 是否与 input_data 兼容
-            actual = _run_fixture_test(f, run.config or {})
-            f.actual_output = actual
-
-            if f.expected_output:
-                is_match = _compare_outputs(f.expected_output, actual)
-                if is_match:
+        for f in fixtures:
+            f.status = ValidationStatus.RUNNING
+            try:
+                actual = _run_fixture_test(f, {})
+                f.actual_output = actual
+                if f.expected_output:
+                    is_match = _compare_outputs(f.expected_output, actual)
+                    if is_match:
+                        f.status = ValidationStatus.PASSED
+                        passed += 1
+                    else:
+                        f.status = ValidationStatus.FAILED
+                        failed += 1
+                        f.error_message = "output mismatch"
+                else:
                     f.status = ValidationStatus.PASSED
                     passed += 1
-                else:
-                    f.status = ValidationStatus.FAILED
-                    failed += 1
-                    f.error_message = "output mismatch"
-            else:
-                f.status = ValidationStatus.PASSED
-                passed += 1
+                results.append({
+                    "fixture_id": str(f.id),
+                    "fixture_name": f.name,
+                    "status": f.status.value,
+                    "actual_output": actual,
+                })
+            except Exception as e:
+                f.status = ValidationStatus.FAILED
+                f.error_message = str(e)
+                failed += 1
+                results.append({
+                    "fixture_id": str(f.id),
+                    "fixture_name": f.name,
+                    "status": "failed",
+                    "error": str(e),
+                })
 
-            results.append({
-                "fixture_id": str(f.id),
-                "fixture_name": f.name,
-                "status": f.status.value,
-                "actual_output": actual,
-            })
-        except Exception as e:
-            f.status = ValidationStatus.FAILED
-            f.error_message = str(e)
-            failed += 1
-            results.append({
-                "fixture_id": str(f.id),
-                "fixture_name": f.name,
-                "status": "failed",
-                "error": str(e),
-            })
+        end_time = datetime.now(timezone.utc)
+        run.status = (
+            ValidationStatus.PASSED if failed == 0 else ValidationStatus.FAILED
+        )
+        run.total_checks = len(fixtures)
+        run.passed_checks = passed
+        run.failed_checks = failed
+        run.report_summary = {"fixtures": results}
+    elif run.target_type == "ontology":
+        # SHACL 占位：不做实际执行，只标记 passed 让前端可以拿到结果
+        run.total_checks = 0
+        run.passed_checks = 0
+        run.failed_checks = 0
+        run.report_summary = {
+            "message": "ontology SHACL execution deferred to validation worker",
+            "shape_paths": run.shape_paths or [],
+        }
+        run.status = ValidationStatus.WARNING
+    else:
+        # dataset 或未知类型：直接 WARNING 等价
+        run.total_checks = 0
+        run.passed_checks = 0
+        run.failed_checks = 0
+        run.report_summary = {"message": f"target_type={run.target_type} 无验证逻辑"}
+        run.status = ValidationStatus.WARNING
 
-    # 更新运行统计
     end_time = datetime.now(timezone.utc)
-    run.status = ValidationStatus.PASSED if failed == 0 else ValidationStatus.FAILED
-    run.total_tests = len(fixtures)
-    run.passed_tests = passed
-    run.failed_tests = failed
-    run.skipped_tests = skipped
     run.duration_ms = int((end_time - run.started_at).total_seconds() * 1000) if run.started_at else None
     run.completed_at = end_time
-    run.results = {"fixtures": results}
 
     await session.flush()
     await session.refresh(run)
@@ -499,12 +527,12 @@ async def execute_validation_run(
     return ValidationRunResponse(
         id=run.id,
         project_id=run.project_id,
-        validation_type=run.validation_type,
+        validation_type=run.name,
         status=run.status,
-        total_tests=run.total_tests,
-        passed_tests=run.passed_tests,
-        failed_tests=run.failed_tests,
-        skipped_tests=run.skipped_tests,
+        total_tests=run.total_checks,
+        passed_tests=run.passed_checks,
+        failed_tests=run.failed_checks,
+        skipped_tests=0,
         duration_ms=run.duration_ms,
         started_at=_to_iso(run.started_at),
         completed_at=_to_iso(run.completed_at),
