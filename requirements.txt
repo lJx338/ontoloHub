@@ -28,10 +28,16 @@ httpx>=0.27.0
 rich>=13.7.0
 typer>=0.12.0
 
-# ===== Connector framework secrets (HIA-71) =====
+# ===== Connector framework secrets (HIA-71）=====
 cryptography>=42.0.0  # Fernet 对称加密，用于连接器 config.secret_fields
 
 # ===== Cache / Session store (HIA-64) =====
 # M1 起引入：候选/映射缓存、SHACL 报告缓存、限流与会话。
 # 不强制启动 — 没 Redis 时降级为「无缓存」模式（HIA-64 退出条件）。
 redis[hiredis]>=5.0.0
+
+# ===== Auth: JWT + password hashing (HIA-64 B1) =====
+python-jose[cryptography]>=3.3.0  # HS256 JWT 签验签
+passlib[bcrypt]>=1.7.4            # bcrypt 密码哈希
+bcrypt>=4.0.0,<5.0                # passlib 1.7.x 兼容范围
+email-validator>=2.0.0            # Pydantic EmailStr 验证
