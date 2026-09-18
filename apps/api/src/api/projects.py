@@ -6,13 +6,19 @@
 - 项目级路由使用 ``require_role(Role.X)``，项目不存在 / 不在成员里 → 404（无侧信道）。
 - 删除走软删除：标记 ``deleted_at`` + 写审计。
 - 用例 / 需求路由：list → VIEWER 可读；create → EDITOR 起。
+- 证据路由（HIA-49 / HIA-55 / M1-02）：支持文件上传 + URL 上报 + 批量对齐。
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path as PathlibPath
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
+from fastapi import APIRouter, Depends, File, HTTPException, Path, Query, Request, UploadFile, status
+from fastapi import Path as Path_
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +26,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.connection import get_session
 from src.db.identity import Membership, Role
 from src.db.project import Project, ProjectStatus, UseCase, Requirement
+from src.db.evidence import Evidence, EvidenceType
+from src.db.governance import AuditEventType
 from src.api.auth import (
     CurrentPrincipal,
     coerce_diff,
@@ -27,7 +35,7 @@ from src.api.auth import (
     record_audit,
     require_role,
 )
-from src.db.governance import AuditEventType
+from src.core.config import get_settings
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -117,6 +125,52 @@ class RequirementResponse(BaseModel):
     created_at: str
 
     model_config = {"from_attributes": True}
+
+
+# ============ 证据路由 Pydantic 模型（HIA-49 / HIA-55 / M1-02）============
+
+class EvidenceCreate(BaseModel):
+    """手动上报证据（URL / 文本 / 外部来源）。"""
+    evidence_type: EvidenceType = Field(..., description="证据类型")
+    location: Optional[str] = Field(None, max_length=500, description="来源位置（如 URL、文件路径、字段名）")
+    field_name: Optional[str] = Field(None, max_length=255, description="关联字段名")
+    record_id: Optional[str] = Field(None, max_length=255, description="关联记录 ID")
+    content: Optional[str] = Field(None, description="证据内容（文本片段、摘要等）")
+    source_identifier: Optional[str] = Field(None, max_length=255, description="来源标识（如 URL、文件名）")
+    source_url: Optional[str] = Field(None, max_length=500, description="来源 URL")
+    ontology_class_iri: Optional[str] = Field(None, max_length=500, description="本体类 IRI")
+    property_iri: Optional[str] = Field(None, max_length=500, description="本体属性 IRI")
+    strength: str = Field("medium", description="证据强度: strong / medium / weak")
+    notes: Optional[str] = Field(None, description="备注")
+
+
+class EvidenceResponse(BaseModel):
+    """证据响应模型。"""
+    id: uuid.UUID
+    evidence_type: EvidenceType
+    location: Optional[str]
+    field_name: Optional[str]
+    record_id: Optional[str]
+    content: Optional[str]
+    source_identifier: Optional[str]
+    source_url: Optional[str]
+    ontology_class_iri: Optional[str]
+    property_iri: Optional[str]
+    is_confirmed: bool
+    strength: str
+    notes: Optional[str]
+    created_by: Optional[str]
+    created_at: str
+
+    model_config = {"from_attributes": True}
+
+
+class EvidenceUploadResponse(BaseModel):
+    """文件上传证据响应。"""
+    evidence: EvidenceResponse
+    file_stored_path: Optional[str]
+    content_hash: Optional[str]
+    file_size: int
 
 
 # ============ 项目路由 ============
@@ -544,3 +598,240 @@ async def create_requirement(
         status=requirement.status,
         created_at=requirement.created_at.isoformat() if requirement.created_at else "",
     )
+
+
+# ============ 证据路由（HIA-49 / HIA-55 / M1-02）============
+
+def _evidence_to_response(e: Evidence) -> EvidenceResponse:
+    return EvidenceResponse(
+        id=e.id,
+        evidence_type=e.evidence_type,
+        location=e.location,
+        field_name=e.field_name,
+        record_id=e.record_id,
+        content=e.content,
+        source_identifier=e.source_identifier,
+        source_url=e.source_url,
+        ontology_class_iri=e.ontology_class_iri,
+        property_iri=e.property_iri,
+        is_confirmed=e.is_confirmed,
+        strength=e.strength,
+        notes=e.notes,
+        created_by=str(e.created_by) if e.created_by else None,
+        created_at=e.created_at.isoformat() if e.created_at else "",
+    )
+
+
+def _get_evidence_storage_path() -> PathlibPath:
+    """返回证据文件存储根目录，不存在则创建。"""
+    repo_root = PathlibPath(__file__).resolve().parents[3]  # apps/api/src/api → apps/api/src → apps/api → repo root
+    storage = repo_root / "data" / "evidence_files"
+    storage.mkdir(parents=True, exist_ok=True)
+    return storage
+
+
+@router.get("/{project_id}/evidences", response_model=list[EvidenceResponse])
+async def list_project_evidences(
+    project_id: uuid.UUID = Path_(..., description="project id"),
+    source_id: Optional[uuid.UUID] = Query(None, description="按来源筛选"),
+    evidence_type: Optional[EvidenceType] = Query(None, description="按类型筛选"),
+    is_confirmed: Optional[bool] = Query(None, description="按确认状态筛选"),
+    search: Optional[str] = Query(None, description="搜索内容"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role(Role.VIEWER)),
+    session: AsyncSession = Depends(get_session),
+) -> list[EvidenceResponse]:
+    """列出项目下所有证据（HIA-55 M1-02：支持分页和筛选）。"""
+    query = select(Evidence).where(Evidence.project_id == project_id)
+    if source_id:
+        query = query.where(Evidence.source_id == source_id)
+    if evidence_type:
+        query = query.where(Evidence.evidence_type == evidence_type)
+    if is_confirmed is not None:
+        query = query.where(Evidence.is_confirmed == is_confirmed)
+    if search:
+        query = query.where(Evidence.content.ilike(f"%{search}%"))
+
+    query = query.offset(offset).limit(limit).order_by(Evidence.created_at.desc())
+    result = await session.execute(query)
+    return [_evidence_to_response(e) for e in result.scalars().all()]
+
+
+@router.post(
+    "/{project_id}/evidences",
+    response_model=EvidenceResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_evidence(
+    data: EvidenceCreate,
+    request: Request,
+    project_id: uuid.UUID = Path_(..., description="project id"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role(Role.EDITOR)),
+    session: AsyncSession = Depends(get_session),
+) -> EvidenceResponse:
+    """手动上报证据（URL / 文本片段 / 外部来源），不需要上传文件。"""
+    principal, _ = ctx
+    evidence = Evidence(
+        project_id=project_id,
+        evidence_type=data.evidence_type,
+        location=data.location,
+        field_name=data.field_name,
+        record_id=data.record_id,
+        content=data.content,
+        source_identifier=data.source_identifier,
+        source_url=data.source_url,
+        ontology_class_iri=data.ontology_class_iri,
+        property_iri=data.property_iri,
+        strength=data.strength,
+        notes=data.notes,
+        extraction_method="manual",
+        created_by=principal.user.id,
+    )
+    session.add(evidence)
+    await session.flush()
+    await session.refresh(evidence)
+    await record_audit(
+        session,
+        event_type=AuditEventType.CREATE,
+        principal=principal,
+        project_id=project_id,
+        target_type="evidence",
+        target_id=str(evidence.id),
+        target_label=data.field_name or data.source_identifier or data.content[:50] if data.content else "",
+        after=coerce_diff(evidence),
+        request=request,
+    )
+    return _evidence_to_response(evidence)
+
+
+@router.post(
+    "/{project_id}/evidences/upload",
+    response_model=EvidenceUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_evidence_file(
+    request: Request,
+    file: UploadFile = File(..., description="证据文件（CSV/XLSX/JSON/Markdown/文本）"),
+    project_id: uuid.UUID = Path_(..., description="project id"),
+    evidence_type: EvidenceType = Query(
+        EvidenceType.DOCUMENT,
+        description="证据类型（默认 DOCUMENT）",
+    ),
+    field_name: Optional[str] = Query(None, description="关联字段名"),
+    record_id: Optional[str] = Query(None, description="关联记录 ID"),
+    location: Optional[str] = Query(None, description="来源位置描述"),
+    notes: Optional[str] = Query(None, description="备注"),
+    strength: str = Query("medium", description="证据强度"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role(Role.EDITOR)),
+    session: AsyncSession = Depends(get_session),
+) -> EvidenceUploadResponse:
+    """上传证据文件（HIA-49）。
+
+    - 存储到 ``data/evidence_files/<project_id>/<uuid>.<ext>``
+    - 支持类型：.csv / .xlsx / .json / .md / .txt / .ttl / .owl / .nt
+    - 文件大小上限由 ``UPLOAD_MAX_SIZE_MB`` 配置（默认 50 MB）
+    - 上传后创建 ``Evidence`` 记录，``extraction_method = "file_upload"``
+    - 不自动创建 Source（若需解析字段请用 ``/sources/upload``）
+    """
+    principal, _ = ctx
+
+    cfg = get_settings().upload
+    content = await file.read()
+    file_size = len(content)
+
+    if file_size == 0:
+        raise HTTPException(status_code=400, detail="empty file")
+
+    if file_size > cfg.max_size_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"file too large; max {cfg.max_size_mb} MB",
+        )
+
+    filename = file.filename or "evidence"
+    ext = os.path.splitext(filename)[1].lower()
+    allowed = set(cfg.allowed_types)
+    if ext not in allowed and "*" not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"file type {ext} not allowed; allowed: {sorted(allowed)}",
+        )
+
+    content_hash = hashlib.sha256(content).hexdigest()
+    file_id = uuid.uuid4()
+    stored_name = f"{file_id}{ext}"
+    storage = _get_evidence_storage_path() / str(project_id)
+    storage.mkdir(parents=True, exist_ok=True)
+    stored_path = storage / stored_name
+    stored_path.write_bytes(content)
+
+    evidence = Evidence(
+        project_id=project_id,
+        evidence_type=evidence_type,
+        location=location or f"file:{stored_path.as_posix()}",
+        field_name=field_name,
+        record_id=record_id,
+        content=None,  # 大文件不内嵌 content；摘要可后续解析
+        source_identifier=filename,
+        source_url=None,
+        ontology_class_iri=None,
+        property_iri=None,
+        strength=strength,
+        notes=notes,
+        extraction_method="file_upload",
+        extraction_params={
+            "original_filename": filename,
+            "content_hash": content_hash,
+            "file_size": file_size,
+            "content_type": file.content_type,
+        },
+        content_hash=content_hash,
+        created_by=principal.user.id,
+    )
+    session.add(evidence)
+    await session.flush()
+    await session.refresh(evidence)
+    await record_audit(
+        session,
+        event_type=AuditEventType.CREATE,
+        principal=principal,
+        project_id=project_id,
+        target_type="evidence",
+        target_id=str(evidence.id),
+        target_label=f"upload:{filename}",
+        after={
+            "evidence_id": str(evidence.id),
+            "filename": filename,
+            "file_size": file_size,
+            "content_hash": content_hash,
+            "stored_path": stored_path.as_posix(),
+        },
+        request=request,
+    )
+    return EvidenceUploadResponse(
+        evidence=_evidence_to_response(evidence),
+        file_stored_path=stored_path.as_posix(),
+        content_hash=content_hash,
+        file_size=file_size,
+    )
+
+
+@router.get("/{project_id}/evidences/{evidence_id}", response_model=EvidenceResponse)
+async def get_project_evidence(
+    evidence_id: uuid.UUID = Path_(..., description="evidence id"),
+    project_id: uuid.UUID = Path_(..., description="project id"),
+    ctx: tuple[CurrentPrincipal, Role] = Depends(require_role(Role.VIEWER)),
+    session: AsyncSession = Depends(get_session),
+) -> EvidenceResponse:
+    """获取单条证据详情（HIA-55 M1-02）。"""
+    result = await session.execute(
+        select(Evidence).where(
+            Evidence.id == evidence_id,
+            Evidence.project_id == project_id,
+        )
+    )
+    evidence = result.scalar_one_or_none()
+    if evidence is None:
+        raise HTTPException(status_code=404, detail="evidence not found")
+    return _evidence_to_response(evidence)
