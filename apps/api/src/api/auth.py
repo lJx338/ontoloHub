@@ -103,21 +103,84 @@ async def ensure_bootstrap_admin() -> User:
 # ---------------------------------------------------------------------------
 
 async def get_current_user(
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_user_email: Optional[str] = Header(default=None, alias=HEADER_EMAIL),
     x_user_id: Optional[str] = Header(default=None, alias=HEADER_ID),
     x_user_name: Optional[str] = Header(default=None, alias=HEADER_NAME),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     session: AsyncSession = Depends(_conn.get_session),
 ) -> CurrentPrincipal:
-    """Resolve the calling user from headers.
+    """Resolve the calling user.
 
     Modes (highest priority first):
-    1. ``X-User-Email``: look up / lazily create the user with that email.
-       If the email is new, it is auto-created with ``GlobalRole.USER``.
-    2. ``X-User-Id``: look up by id; 401 if not found.
-    3. Fallback: bootstrap admin (single-tenant dev convenience).
+    1. ``Authorization: Bearer <jwt>`` — JWT access token（HIA-64 B1）
+    2. ``X-API-Key: ont_xxxxx`` — API Key（HIA-64 B1，机器对机器）
+    3. ``X-User-Email`` — dev mode header（向后兼容）
+    4. ``X-User-Id`` — dev mode header
+    5. Fallback：bootstrap admin（dev convenience）
 
     Returns a ``CurrentPrincipal``; downstream routes consume ``principal.user``.
     """
+    # ---- 1. JWT Bearer ----
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(None, 1)[1].strip()
+        try:
+            from src.core.auth import AuthError, decode_token, get_user_by_id
+
+            payload = decode_token(token)
+            if payload.get("type") != "access":
+                raise AuthError("not an access token")
+            user_id_str = payload.get("sub")
+            if not user_id_str:
+                raise AuthError("missing sub")
+            user_uuid = uuid.UUID(user_id_str)
+        except (AuthError, ValueError, Exception) as e:
+            # JWTError 也走这里
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"invalid bearer token: {e}" if str(e) else "invalid bearer token",
+            ) from e
+        user = await get_user_by_id(session, user_uuid)
+        if user is None or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="user not found or inactive",
+            )
+        return await _make_principal(session, user)
+
+    # ---- 2. API Key ----
+    if x_api_key:
+        from src.core.auth import (
+            constant_time_eq,
+            get_user_by_id,
+            hash_api_key,
+        )
+        from src.db.identity import ApiKey
+
+        key_hash = hash_api_key(x_api_key)
+        result = await session.execute(
+            select(ApiKey).where(ApiKey.key_hash == key_hash)
+        )
+        api_key = result.scalar_one_or_none()
+        if api_key is None or not api_key.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid or expired API key",
+            )
+        # 检查 active user
+        user = await get_user_by_id(session, api_key.user_id)
+        if user is None or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="API key owner is inactive",
+            )
+        # 更新 last_used_at
+        api_key.last_used_at = datetime.now(timezone.utc)
+        session.add(api_key)
+        await session.flush()
+        return await _make_principal(session, user)
+
+    # ---- 3/4. Dev mode headers (向后兼容) ----
     user: Optional[User] = None
 
     if x_user_email:
@@ -168,15 +231,18 @@ async def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN, detail="user is inactive"
         )
 
+    return await _make_principal(session, user)
+
+
+async def _make_principal(session: AsyncSession, user: User) -> CurrentPrincipal:
+    """Build principal + bump last_login_at. Shared by JWT / API Key / header 路径。"""
     user.last_login_at = datetime.now(timezone.utc)
     session.add(user)
     await session.flush()
-
-    principal = CurrentPrincipal(
+    return CurrentPrincipal(
         user=user,
         is_admin=(user.global_role == GlobalRole.ADMIN.value),
     )
-    return principal
 
 
 # ---------------------------------------------------------------------------
@@ -335,9 +401,9 @@ async def record_audit(
     *,
     event_type: AuditEventType,
     principal: CurrentPrincipal,
-    project_id: Optional[uuid.UUID],
     target_type: str,
     target_id: Optional[str],
+    project_id: Optional[uuid.UUID] = None,
     target_label: Optional[str] = None,
     before: Optional[dict[str, Any]] = None,
     after: Optional[dict[str, Any]] = None,

@@ -165,6 +165,11 @@ app.include_router(users.router, prefix="/api")
 app.include_router(members.router)
 app.include_router(audit.router)
 
+# HIA-64 B1: JWT + API Key 认证（HIA-51 之上叠加）
+from src.api import auth_jwt
+app.include_router(auth_jwt.auth_router, prefix="/api")
+app.include_router(auth_jwt.apikey_router, prefix="/api")
+
 # Evidence 收件箱 / 剖析执行
 from src.api.sources import ev_router, prof_router
 app.include_router(ev_router)
@@ -211,5 +216,11 @@ async def api_root() -> dict:
             "members": "/projects/{id}/members",
             "audit": "/projects/{id}/audit",
             "audit_verify": "/audit/verify",
+            "auth_login": "/api/auth/login",
+            "auth_refresh": "/api/auth/refresh",
+            "auth_me": "/api/auth/me",
+            "auth_set_password": "/api/auth/set-password",
+            "auth_bootstrap": "/api/auth/bootstrap",
+            "api_keys": "/api/api-keys",
         },
     }
