@@ -987,6 +987,147 @@ r = await client.post(
 
 **规避**：不要用 `SKIPPED`；用 `WARNING` 替代。
 
+#### 6.34 `from x import func` 让 `monkeypatch.setattr` 失效（HIA-79 D2）
+
+**症状**：测试用 `monkeypatch.setattr(sso_client_mod, "fetch_discovery", fake)`
+替换模块属性，运行时仍然调到原版（跑出去打真实 HTTP，CI 报 `ConnectError`）。
+
+**根因**：`sso.py` 的 `from src.services.sso_client import fetch_discovery` 把
+函数对象**绑定到 `sso.py` 模块自己的命名空间**。后续 `monkeypatch.setattr`
+只改的是 `sso_client_mod` 模块的属性，`sso.py` 那份绑定不受影响。
+
+**修复模板**：在被测代码里改成"导入模块、走模块属性访问"：
+
+```python
+# 错：monkeypatch 失效
+from src.services.sso_client import fetch_discovery, exchange_code_for_tokens
+await fetch_discovery(...)
+
+# 对：测试可以 stub
+from src.services import sso_client as sso_client_mod
+await sso_client_mod.fetch_discovery(...)
+```
+
+测试继续按原方式 patch：
+
+```python
+monkeypatch.setattr(sso_client_mod, "fetch_discovery", _fake_fetch_discovery)
+```
+
+**何时该用**：（a）外部 IO 的 stub（HTTP/SMTP/DB/SDK），（b）需要替成
+raise 触发错误路径，（c）需要断言是否被调用。**何时不用**：纯 helper
+（PKCE / URL builder / claim 提取）——这些测试直接 import 调用就好。
+
+#### 6.35 SQLite DateTime 列丢失 tz info — 比较前先 normalize（HIA-79 D2）
+
+**症状**：模型声明 `expires_at: Mapped[datetime] = mapped_column(
+DateTime(timezone=True), ...)`，写入 `datetime.now(timezone.utc)`，读出
+后 `self.expires_at < datetime.now(timezone.utc)` 抛
+`TypeError: can't compare offset-naive and offset-aware datetimes`。
+
+**根因**：SQLite 没有原生 timestamp with timezone，写入时 SQLite 层把
+tzinfo 剥掉；读出来是 naive datetime。PostgreSQL 不会这样，所以本地
+SQLite 测试通过、上 PG 才暴露，或反过来。
+
+**修复模板**：所有"时间比较"都通过一个 helper 走：
+
+```python
+@property
+def is_expired(self) -> bool:
+    from datetime import datetime, timezone
+    exp = self.expires_at
+    if exp.tzinfo is None:                          # SQLite 把 tz 丢了
+        exp = exp.replace(tzinfo=timezone.utc)
+    return exp < datetime.now(timezone.utc)
+```
+
+同样的模式适用于所有"`expires_at` / `valid_until` / `not_before`"类的
+业务时间字段。如果跨 dialect 都要正确，统一在 ORM 层 normalize 比每个
+调用方各自处理更稳。
+
+#### 6.36 `async_session_factory()` 不自动 commit（HIA-79 D2）
+
+**症状**：测试 fixture 里
+```python
+async with async_session_factory() as s:
+    row = (await s.execute(select(...))).scalar_one()
+    row.expires_at = past_datetime
+    await s.flush()                              # 只 flush 没 commit
+    state = row.state
+
+# 接着打下一个请求，期望读到修改后的值
+r = await client.get(f"/api/sso/callback?...&state={state}")
+assert r.status_code == 400                     # 实际返回 302
+```
+
+**根因**：`async with async_session_factory()` 退出时**不会自动 commit**。
+`flush()` 只把改动推到 connection 缓冲；事务没 commit，关闭时就回滚到
+上一次 commit 之后的快照。下一个请求看到的是修改前的值。
+
+**修复**：fixture 里手动 commit：
+
+```python
+async with async_session_factory() as s:
+    row = (await s.execute(...)).scalar_one()
+    row.expires_at = past_datetime
+    await s.flush()
+    await s.commit()                            # ← 必须
+    state = row.state
+```
+
+**对比**：FastAPI `Depends(get_session)` 会自动 commit（见
+`src/db/connection.py`），所以走 HTTP 路径的代码不用担心；后台 task /
+测试 / 脚本里自己开 session 的代码路径必须显式 commit。这条与
+§25.8（workflow executor owned-session）是同一根因的不同表现。
+
+#### 6.37 加密字段的"加密别名"会让测试断在奇怪的格子（HIA-79 D2）
+
+**症状**：测试期望 `body["config"]["client_secret"] == "***"`，但实际返
+回明文；又期望数据库里 `enc:v1:` 前缀存在，但实际什么前缀都没有。
+
+**根因**：默认 `secret_fields=["client_secret_enc"]`（"加密字段别名"），
+但 API 接收/返回的是 `client_secret`。结果：
+- 写入时：`config["client_secret"]` 是明文，`config["client_secret_enc"]`
+  不存在 → 没东西被加密；
+- 读取时：mask 在 `client_secret_enc` 上做 → `client_secret` 仍是明文。
+
+**最佳实践**：加密的字段名 = 用户写的字段名 = OIDC/SAML/LDAP 规范字段名。
+OIDC spec 的字段就叫 `client_secret`，不要硬造 `client_secret_enc` 别名
+——加一层名字混淆只会让 API/DB/前端 三方契约对不齐。
+
+```python
+# 错：别名导致 mask 和 encrypt 命中不同 key
+DEFAULT_OIDC_SECRET_FIELDS = ["client_secret_enc"]
+
+# 对：和 OIDC spec 字段名一致
+DEFAULT_OIDC_SECRET_FIELDS = ["client_secret"]
+```
+
+如果将来真的需要"明文 vs 加密"区分，靠字段值的 `enc:v1:` 前缀判别
+（`encrypt_value` 已经这样做了），不要再造一层字段别名。
+
+#### 6.38 open-redirect 防御要在 login 入口就 sanitize，不能只信 callback（HIA-79 D2）
+
+**症状**：`return_to=https://attacker.example/steal` 进到 login 接口；
+login 接口只把 `return_to` 原样存到 `SsoLoginSession.relay_state`；callback
+接口虽然会 `_validate_return_to` 替换为 `/`，但 `relay_state` 列里已经
+留了攻击者 URL，DB dump / 审计就能看到这个 URL。
+
+**修复**：在 login 入口就过一次 sanitizer：
+
+```python
+safe_relay_state = _validate_return_to(return_to)
+sso_session = SsoLoginSession(
+    ...
+    relay_state=safe_relay_state,
+    ...
+)
+```
+
+**原则**：任何"用户输入且会回显/落盘"的字段，sanitize 在**第一个**入
+口做，而不是依赖"后续每个使用点都会过滤"。后者每加一个 caller 就多
+一个漏点，前者一处搞定。
+
 #### 6.33.6 写 E2E 测试时：先走通，再打磨
 
 **经验**：写 E2E 测试的过程中发现了 4 个 API 契约 bug
@@ -2672,5 +2813,140 @@ assert all(row["status"] == "success" for row in sr)
 
 **注意**：批量测试仍有 CLAUDE.md 第 1 条记录的 `reinit_engines` 时序问题
 （LookupError 在第二个测试出现），与本 pitfall 无关，不要混在一起追。
+
+---
+
+## 26. SSO / Identity Provider（HIA-79 / D2）
+
+企业级 SSO 配置 + OIDC 授权码（PKCE）登录 + JIT 用户配置。SAML/LDAP
+在 D2 仅做 schema 占位（实际登录流留到 D2.x）。
+
+### 26.1 模块边界
+
+| 模块 | 职责 |
+| --- | --- |
+| `apps/api/src/db/sso.py` | `IdentityProvider`、`SsoLoginSession` ORM + `is_expired` helper |
+| `apps/api/src/services/sso_client.py` | OIDC discovery cache、JWKS cache、PKCE、auth URL builder、code→token、ID-token verify |
+| `apps/api/src/api/sso.py` | `provider_router`（CRUD + test）+ `login_router`（login/callback） |
+| `apps/api/alembic/versions/2026_09_19_0011_sso.py` | 两张表的迁移 |
+
+### 26.2 数据模型
+
+```python
+class IdentityProvider(Base, UUIDMixin, TimestampMixin):
+    workspace_id, name, protocol, status
+    config: JSON              # {"issuer_url", "client_id", "client_secret", ...}
+    claim_mapping: JSON       # {"email": "email", "display_name": "name"}
+    secret_fields: JSON       # ["client_secret"]
+    auto_provision: bool
+    force_sso: bool
+    last_test_status / message / at
+    created_by
+
+    __table_args__ = (UniqueConstraint("workspace_id", "protocol"), ...)
+```
+
+唯一约束 `uq_identity_providers_workspace_protocol` 让一个 workspace
+**每种协议最多一个 IdP**（要换 IdP 先 disable 旧的）。
+
+`SsoLoginSession` 跟踪 in-flight flow：`state`（CSRF）/ `nonce`（OIDC
+ID-token）/ `code_verifier`（PKCE）/ `redirect_uri` / `relay_state`
+（已 sanitize 过的 return_to）。10 分钟 TTL，`consumed_at` 标记单次
+使用。
+
+### 26.3 加密 / Mask 约定
+
+- **加密**：用 `src.core.secrets.encrypt_value`（Fernet，带 `enc:v1:` 前缀）。
+- **Mask**：API 返回前 `mask_secret_fields(config, idp.secret_fields)`，
+  把所有声明的 secret 字段替换成 `"***"`。
+- **默认 `secret_fields = ["client_secret"]`**：和 OIDC spec 字段名一致；
+  不要造 `client_secret_enc` 别名（详见 §6.37）。
+- **解密**：callback 里 `decrypt_value(plain_cfg[f])` 逐字段解；不在 DB
+  里直接读 secret 原文。
+
+### 26.4 OIDC 流程（RFC 6749 + RFC 7636 + OpenID Connect Core）
+
+```
+┌────────────┐    GET /api/sso/{slug}/login?return_to=...
+│  Browser   │ ─────────────────────────────────────────► Backend
+│            │ ◄─ 302 /api/sso/callback                   │
+│            │ ─► GET /authorize?...&code_challenge=...    │ IdP
+│            │ ◄─ 302 /api/sso/callback?code=...&state=... │
+│            │ ─► GET /api/sso/callback?...               │ Backend
+└────────────┘                                            │
+                                                          ▼
+                                                  token exchange
+                                                  ID-token verify
+                                                  JIT user
+                                                  JWT issued
+                                                  302 /return_to?token=...
+```
+
+**关键不变量**：
+
+1. `state` 单次使用 + 短期 TTL（10 min）—— callback 命中后立刻写
+   `consumed_at`，replay 会 400。
+2. `nonce` 在 ID-token 验证时强制比对，防重放。
+3. PKCE `code_verifier` 从未离开 server；authorize 请求只带
+   `code_challenge`（SHA-256(verifier)）。
+4. `relay_state` 在 login 入口就 sanitize 一次（§6.38），不再依赖
+   callback 兜底。
+
+### 26.5 API 契约
+
+| 端点 | 方法 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `/api/workspaces/{wid}/sso/providers` | `POST` | workspace ADMIN | 创建 IdP（自动 encrypt secret） |
+| 同上 | `GET` | workspace MEMBER+ | 列表（mask 后返回） |
+| `/api/workspaces/{wid}/sso/providers/{pid}` | `GET` / `PATCH` / `DELETE` | GET:MEMBER+ / PATCH,DELETE:ADMIN | 单个操作 |
+| `/api/workspaces/{wid}/sso/providers/{pid}/test` | `POST` | workspace ADMIN | test_connection：OIDC 跑 discovery |
+| `/api/sso/{slug}/login` | `GET` | 公开 | 302 → IdP authorize URL |
+| `/api/sso/callback` | `GET` | 公开 | IdP 回调入口；成功 → `return_to?token=...` |
+
+错误码：
+
+- `user_not_provisioned`：`auto_provision=false` + IdP 返回未知 email
+- `discovery_unreachable` / `discovery_failed` / `discovery_invalid_json`
+- `token_exchange_failed` / `id_token_invalid` / `id_token_nonce_mismatch`
+- 错误一律通过 redirect 的 query string 回传（`sso_error=...&sso_error_message=...`），
+  不会泄漏 secret / private key material。
+
+### 26.6 强制 SSO（force_sso）
+
+workspace 的 IdP 设 `force_sso=true` 时，callback 成功后**立刻清掉
+该用户的 `password_hash`**，让本地密码登录不可用。bootstrap admin
+（`admin@ontolohub.local`）豁免，用于恢复 tenant。
+
+注意：
+
+- 只清 **当前 workspace 的 IdP 登录过的用户**。用户在别的 workspace 没
+  走过 SSO 时不动。
+- 不影响其他认证方式（API Key / JWT access token 在有效期内仍可用，
+  直到 token 自然过期）。
+
+### 26.7 避坑
+
+- §6.34 `from x import func` 失效 — `sso.py` 通过 `sso_client_mod.X()`
+  调用 OIDC client，保证测试能 monkeypatch。
+- §6.35 SQLite DateTime 列丢 tz — `is_expired` 里 normalize 后比较。
+- §6.36 `async_session_factory()` 不自动 commit — 测试 fixture 改了
+  row 必须 `await s.commit()`。
+- §6.37 加密字段名 = OIDC spec 字段名 — 别名只会让契约对不齐。
+- §6.38 open-redirect 在 login 入口就 sanitize。
+
+### 26.8 测试覆盖清单
+
+参见 `apps/api/tests/test_sso.py`：
+
+- Provider CRUD（admin-only、secret 加密、mask、唯一性）
+- 工作空间隔离（非成员 404）
+- OIDC helper 单测（PKCE shape、auth URL builder）
+- 完整 callback flow（JIT 创 user、加入 workspace、issue JWT）
+- 安全负例：replay / expired / `auto_provision=false` / force_sso 清密码 /
+  外部 `return_to` sanitize
+
+共 19 个用例，全部走 ASGI transport + monkeypatch OIDC client，避免打
+真实 IdP。
+
 
 

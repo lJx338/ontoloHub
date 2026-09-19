@@ -67,6 +67,12 @@ from .workspace import (
     WorkspaceRole,
     workspace_has_role,
 )
+from .sso import (
+    IdentityProvider,
+    SsoLoginSession,
+    SsoProtocol,
+    SsoProviderStatus,
+)
 
 __all__ = [
     "Base",
@@ -170,4 +176,9 @@ __all__ = [
     "WorkspacePlan",
     "WorkspaceRole",
     "workspace_has_role",
+    # SSO / IdP（HIA-79 D2）
+    "IdentityProvider",
+    "SsoLoginSession",
+    "SsoProtocol",
+    "SsoProviderStatus",
 ]
