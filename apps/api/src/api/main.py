@@ -57,6 +57,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.scheduler_stop = scheduler_stop_event
     app.state.scheduler_task = scheduler_task
 
+    # HIA-90 D5: 启动备份调度器（每天/每 6h 检查一次）
+    backup_scheduler_stop = asyncio.Event()
+    backup_scheduler_task = asyncio.create_task(
+        _backup_scheduler_loop(backup_scheduler_stop, interval=120.0)
+    )
+    app.state.backup_scheduler_stop = backup_scheduler_stop
+    app.state.backup_scheduler_task = backup_scheduler_task
+
     yield
 
     # 关闭
@@ -69,6 +77,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     scheduler_stop_event.set()
     try:
         await asyncio.wait_for(scheduler_task, timeout=2.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+
+    backup_scheduler_stop.set()
+    try:
+        await asyncio.wait_for(backup_scheduler_task, timeout=2.0)
     except (asyncio.TimeoutError, asyncio.CancelledError):
         pass
 
@@ -91,6 +105,28 @@ async def _cron_loop(stop_event: asyncio.Event, interval: float = 60.0) -> None:
             await run_cron_triggers()
         except Exception as exc:
             logger.warning("cron loop iteration failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            continue
+
+
+async def _backup_scheduler_loop(
+    stop_event: asyncio.Event, interval: float = 120.0,
+) -> None:
+    """HIA-90 D5: 备份调度器循环，每 2 分钟检查一次 schedule。
+
+    调度本身由 croniter 解析；这里只是节拍器。
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    from src.services.backup_scheduler import run_backup_schedules
+
+    while not stop_event.is_set():
+        try:
+            await run_backup_schedules()
+        except Exception as exc:
+            logger.warning("backup scheduler iteration failed: %s", exc)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except asyncio.TimeoutError:
@@ -251,6 +287,10 @@ from src.api.sso import provider_router as sso_provider_router, login_router as 
 app.include_router(sso_provider_router)
 app.include_router(sso_login_router)
 
+# HIA-90 D5: Backup & Disaster Recovery API（数据库 / 文件 / 配置）
+from src.api.backup import router as backup_router
+app.include_router(backup_router)
+
 
 @app.get("/api")
 async def api_root() -> dict:
@@ -298,5 +338,13 @@ async def api_root() -> dict:
             "auth_set_password": "/api/auth/set-password",
             "auth_bootstrap": "/api/auth/bootstrap",
             "api_keys": "/api/api-keys",
+            "backups": "/api/admin/backups",
+            "backup_verify": "/api/admin/backups/{id}/verify",
+            "backup_restore": "/api/admin/backups/{id}/restore",
+            "backup_expire": "/api/admin/backups/expire",
+            "backup_schedules": "/api/admin/backup-schedules",
+            "dr_drill": "/api/admin/dr-drill",
+            "dr_drills": "/api/admin/dr-drills",
+            "backup_health": "/api/admin/health/backup",
         },
     }

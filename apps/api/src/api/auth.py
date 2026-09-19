@@ -21,7 +21,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING, Union
 
 from fastapi import Depends, Header, HTTPException, Path, Query, Request, status
 from sqlalchemy import select
@@ -400,7 +400,7 @@ async def record_audit(
     session: AsyncSession,
     *,
     event_type: AuditEventType,
-    principal: CurrentPrincipal,
+    principal: Union[CurrentPrincipal, "User"],
     target_type: str,
     target_id: Optional[str],
     project_id: Optional[uuid.UUID] = None,
@@ -413,8 +413,17 @@ async def record_audit(
     """Write one audit event with hash-chain linkage.
 
     The session is *not* committed here; the caller owns the transaction.
+
+    ``principal`` may be either a :class:`CurrentPrincipal` (from
+    ``Depends(get_current_user)``) **or** a raw :class:`User` instance
+    (e.g. when the caller already holds a User from a project/admin
+    dependency).  The audit event only needs ``id`` and
+    ``display_name``, so we duck-type once at the top.
     """
-    actor = principal.user
+    if isinstance(principal, CurrentPrincipal):
+        actor = principal.user
+    else:
+        actor = principal
     actor_ip = None
     actor_ua = None
     if request is not None:

@@ -89,6 +89,7 @@ data/uploads/
 data/runtime/
 data/cache/
 storage/
+apps/api/data/
 
 # ===== Logs =====
 logs/
