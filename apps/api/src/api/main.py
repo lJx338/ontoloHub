@@ -226,6 +226,10 @@ app.include_router(change_request_router)
 from src.api.action import router as action_router
 app.include_router(action_router)
 
+# HIA-70 C1: Function CRUD + test-run endpoint（独立可寻址的函数）
+from src.api.function import router as function_router
+app.include_router(function_router)
+
 # HIA-75 C3: Webhook / Trigger 集成 API
 from src.api.webhooks import router as webhooks_router, trigger_router
 app.include_router(webhooks_router)
@@ -278,6 +282,8 @@ async def api_root() -> dict:
             "deployments": "/deployments",
             "actions": "/projects/{id}/actions",
             "action_runs": "/projects/{id}/action-runs",
+            "functions": "/projects/{id}/functions",
+            "function_test": "/projects/{id}/functions/{fid}/test",
             "workflows": "/projects/{id}/workflows",
             "workflow_executions": "/projects/{id}/workflow-executions",
             "workspaces": "/api/workspaces",
