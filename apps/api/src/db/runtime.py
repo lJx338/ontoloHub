@@ -141,6 +141,100 @@ class ActionType(Base, UUIDMixin, TimestampMixin, ProjectMixin):
     )
 
 
+# HIA-70 C1: Function 表（独立可寻址的函数实体）
+# ActionType 仍然可内联代码；新增 Function 允许不同 Action 共享同一段代码，
+# 也允许 Function 单独被引用（workflow step / 函数测试面板）。
+
+
+class FunctionLanguage(str, Enum):
+    """Function 源码语言。"""
+
+    PYTHON = "python"
+    JAVASCRIPT = "javascript"
+    TYPESCRIPT = "typescript"
+
+
+class Function(Base, UUIDMixin, TimestampMixin, ProjectMixin):
+    """A reusable function definition (HIA-70 C1).
+
+    与 ActionType.code/runtime 解耦：Function 是被命名、可复用、可独立测试
+    的代码段；ActionType 可通过 ``function_id`` 引用一个 Function，
+    也可继续保留内联 code（兼容老数据）。
+    """
+
+    __tablename__ = "functions"
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    api_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    language: Mapped[FunctionLanguage] = mapped_column(
+        SQLEnum(FunctionLanguage),
+        default=FunctionLanguage.PYTHON,
+        nullable=False,
+    )
+
+    source_code: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    # 可选：与 ActionType.code 的元数据对应（签名、timeout 等）
+    parameters_schema: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    return_schema: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    config: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    created_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+
+    __table_args__ = (
+        # 同 project 下 api_name 唯一
+        Index(
+            "uq_functions_project_api_name",
+            "project_id",
+            "api_name",
+            unique=True,
+        ),
+    )
+
+
+class FunctionRun(Base, UUIDMixin, TimestampMixin, ProjectMixin):
+    """A single test-run of a Function (HIA-70 C1 ``/test`` endpoint).
+
+    与 ActionRun 区别：FunctionRun 不进入异步调度、每次 ``/test`` 都
+    立即同步执行；用于编辑器内的「试运行」按钮。
+    """
+
+    __tablename__ = "function_runs"
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    function_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("functions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    input_data: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    output_data: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    triggered_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+
 class ActionRun(Base, UUIDMixin, TimestampMixin, ProjectMixin):
     """A single execution of an ActionType."""
 
