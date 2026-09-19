@@ -246,6 +246,11 @@ from src.api.release_line import router as release_line_router, merge_router as 
 app.include_router(release_line_router)
 app.include_router(release_line_merge_router)
 
+# HIA-79 D2: SSO / Identity Provider API（企业级 SSO）
+from src.api.sso import provider_router as sso_provider_router, login_router as sso_login_router
+app.include_router(sso_provider_router)
+app.include_router(sso_login_router)
+
 
 @app.get("/api")
 async def api_root() -> dict:
@@ -279,6 +284,10 @@ async def api_root() -> dict:
             "workspace_members": "/api/workspaces/{id}/members",
             "user_workspaces": "/api/users/me/workspaces",
             "workspace_quota": "/api/workspaces/{id}/quota",
+            "sso_providers": "/api/workspaces/{id}/sso/providers",
+            "sso_test_provider": "/api/workspaces/{id}/sso/providers/{pid}/test",
+            "sso_login": "/api/sso/{workspace_slug}/login",
+            "sso_callback": "/api/sso/callback",
             "users": "/api/users",
             "members": "/projects/{id}/members",
             "audit": "/projects/{id}/audit",
