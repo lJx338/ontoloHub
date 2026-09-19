@@ -132,8 +132,21 @@ _PYTHON_RUNNER = textwrap.dedent('''
         exec(code_obj, globals_dict)
     except SystemExit:
         raise
-    except Exception:
+    except Exception as exc:
+        # Catch user code errors and propagate them via the marker so the
+        # parent process sees the original exception type + message,
+        # rather than "no <<<RESULT>>> marker found".
         traceback.print_exc(file=sys.stderr)
+        err_payload = {
+            "_error": f"{type(exc).__name__}: {exc}",
+            "_traceback": traceback.format_exc(),
+        }
+        try:
+            err_json = json.dumps(err_payload, default=str, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            err_json = json.dumps({"_error": "non-serializable error payload"})
+        sys.stdout.write(f"<<<RESULT>>>\\n{err_json}\\n<<<END>>>\\n")
+        sys.stdout.flush()
         sys.exit(1)
 
     # 输出 result（JSON 序列化）

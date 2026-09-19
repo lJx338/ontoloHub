@@ -143,6 +143,13 @@ async def run_function_step(
             raise RuntimeError(
                 f"sandbox timed out after {out.get('duration_ms', '?')}ms"
             )
+        # User code raised an exception: the sandbox runner writes
+        # ``{"_error": "<ExcType>: <message>"}`` into the result envelope so
+        # the original exception type/message propagate to the workflow step
+        # failure record (instead of "no <<<RESULT>>> marker found").
+        result_payload = out.get("result")
+        if isinstance(result_payload, dict) and "_error" in result_payload:
+            raise RuntimeError(str(result_payload["_error"]))
         exit_code = out.get("exit_code", 0)
         if exit_code not in (0, None):
             stderr = (out.get("stderr") or "").strip().splitlines()[-1] if out.get("stderr") else ""
