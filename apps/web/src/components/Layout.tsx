@@ -1,11 +1,13 @@
 import { NavLink, Outlet } from 'react-router-dom'
 import {
+  Code2,
   LayoutDashboard,
   FolderKanban,
   Network,
   Inbox,
   ShieldCheck,
   Rocket,
+  Zap,
 } from 'lucide-react'
 
 const nav = [
@@ -14,6 +16,8 @@ const nav = [
   { to: '/ontologies', label: '本体', icon: Network },
   { to: '/evidence', label: '证据收件箱', icon: Inbox },
   { to: '/validation', label: '验证', icon: ShieldCheck },
+  { to: '/functions', label: 'Functions', icon: Code2 },
+  { to: '/actions', label: 'Actions', icon: Zap },
   { to: '/releases', label: '变更/发布', icon: Rocket },
 ]
 
