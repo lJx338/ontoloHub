@@ -47,3 +47,6 @@ RestrictedPython>=8.0             # Python AST 解析（编译期检查，不做
 
 # ===== Webhook / Trigger integration (HIA-75 C3) =====
 APScheduler>=3.10.0               # Cron-based schedule trigger execution
+
+# ===== Backup & DR (HIA-90 D5) =====
+croniter>=2.0.0                   # Cron expression parsing for backup schedules

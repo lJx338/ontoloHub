@@ -178,6 +178,49 @@ class RedisSettings(BaseSettings):
     )
 
 
+class BackupSettings(BaseSettings):
+    """备份与灾难恢复配置（HIA-90 D5）。
+
+    备份以本地目录为一级存储，可叠加 S3/MinIO 兼容对象存储做二级异地。
+    加密密钥经环境变量注入；空字符串 = 不加密（仅 dev/CI）。
+    """
+    # 一级存储根目录（每个 backup 一个 tar.gz 子包）
+    storage_dir: str = Field(default="./data/backups")
+    # 临时解压目录（verify / restore dry-run 用）
+    work_dir: str = Field(default="./data/backup_work")
+    # 用户上传/快照目录，参与 files 类备份
+    uploads_dir: str = Field(default="./data/uploads")
+    exports_dir: str = Field(default="./exports")
+
+    # 加密：Fernet（AES-128-CBC + HMAC），密钥为 url-safe base64
+    # 留空 = 不加密。生产强烈建议设置 BACKUP_ENCRYPTION_KEY。
+    encryption_key: str = Field(default="")
+
+    # 默认保留策略（按 backup kind 可单独覆盖）
+    default_retention_days: int = Field(default=30, ge=1, le=3650)
+    full_retention_days: int = Field(default=90, ge=1, le=3650)
+    incremental_retention_days: int = Field(default=7, ge=1, le=365)
+
+    # 调度
+    schedule_enabled: bool = Field(default=True)
+    full_schedule_cron: str = Field(default="0 3 * * *")          # 每天 03:00 全量
+    incremental_schedule_cron: str = Field(default="0 */6 * * *")  # 每 6h 增量
+
+    # 指标与告警阈值
+    max_backup_age_seconds: int = Field(default=86400 * 2, ge=60)  # 超过 2 天无成功全量就告警
+    failure_alert_webhook: str = Field(default="")
+
+    # 是否启用 DR 演练（每周一次；可关停跳过）
+    dr_drill_enabled: bool = Field(default=False)
+
+    model_config = SettingsConfigDict(
+        env_prefix="BACKUP_",
+        env_file=_DEFAULT_ENV_FILE,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
 class Settings(BaseSettings):
     """全局配置"""
     # 优先从仓库根目录的 .env 读取，这样 alembic 在 apps/api/ 子目录跑也能加载。
@@ -205,6 +248,7 @@ class Settings(BaseSettings):
     upload: UploadSettings = Field(default_factory=UploadSettings)
     log: LogSettings = Field(default_factory=LogSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
+    backup: BackupSettings = Field(default_factory=BackupSettings)
 
     def model_post_init(self, __context: object) -> None:
         # 把 SQLite 相对路径钉到仓库根

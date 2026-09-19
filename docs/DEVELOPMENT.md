@@ -1141,6 +1141,120 @@ sso_session = SsoLoginSession(
 3. 发现 422 时，把 `r.text` 完整打印出来；FastAPI 的 `detail` 字段会准确告诉
    你缺了什么字段和类型不匹配的原因。
 
+#### 6.39 `record_audit(principal=...)` 同时被两种 caller 调用 — duck-type 一下（HIA-90 D5）
+
+**症状**：从 HIA-77 D1 开始，admin-only 端点用
+`user: User = Depends(require_global_admin)` 拿到的是 `User`，但 `record_audit`
+的签名是 `principal: CurrentPrincipal`，第一行就是 `actor = principal.user`，
+运行时报 `'User' object has no attribute 'user'`。
+
+**根因**：项目级端点（`webhooks.py` / `workflow.py` / `release_line.py` / `objects.py`）
+用 `Depends(get_current_user)` 拿到 `CurrentPrincipal`，传 `principal=principal`；
+admin-only 端点（`backup.py` / 后续的 `auth_admin.py` 风格的依赖）直接返
+`User`，传 `principal=user`。两种传法一直并存，但 `record_audit` 内部只
+认 `CurrentPrincipal`。
+
+**修复**：`record_audit` 一开始 duck-type 一下，accept `Union[CurrentPrincipal, User]`：
+
+```python
+async def record_audit(session, *, principal, ...):
+    if isinstance(principal, CurrentPrincipal):
+        actor = principal.user
+    else:
+        actor = principal  # User 自身
+    ...
+```
+
+不要去改每个 caller — 那会推动所有 admin endpoint 改返回类型，
+影响面比改 `record_audit` 大得多。`require_global_admin` 故意返 `User`
+是为了让 caller 拿到 `.email` / `.global_role` 这种不需要通过 principal
+间接访问的属性。
+
+#### 6.40 pytest fixture 里用 env-var 调配置，但 manager 没看到（HIA-90 D5）
+
+**症状**：`isolated_app` fixture 已经
+`monkeypatch.setenv("BACKUP_STORAGE_DIR", str(storage))`，但下游
+`manager` fixture 直接构造 `BackupManager(storage_dir=isolated_app["storage"])`
+时，manager 内部走的 `settings.backup.storage_dir` 还是 module-import
+时的旧值。
+
+**根因**：`BackupManager` 内部从 `settings.backup.storage_dir` 读路径，
+而 `settings` 是 module-level singleton，启动时通过 `get_settings()`
+加载。`monkeypatch.setenv` 只影响**新一次** `get_settings()` 调用 —
+但 settings 已经缓存了。
+
+**修复**：在 `manager` fixture 里：
+
+1. `cfg.get_settings.cache_clear()` 强制重读。
+2. `monkeypatch.setattr(cfg.settings.backup, "storage_dir", ...)` 直接改
+   缓存好的 settings 对象。
+
+```python
+@pytest_asyncio.fixture
+async def manager(isolated_app, monkeypatch):
+    from src.services.backup import BackupManager
+    from src.core import config as cfg
+
+    cfg.get_settings.cache_clear()
+    monkeypatch.setattr(cfg.settings.backup, "storage_dir", str(...))
+    monkeypatch.setattr(cfg.settings.backup, "work_dir", str(...))
+    # ... 所有 manager 会读到的字段
+    return BackupManager(storage_dir=..., work_dir=..., encryption_key="")
+```
+
+教训：把"读 env"和"读 settings attribute"分开对待。`monkeypatch.setenv`
+只覆盖前者；后者要直接 `setattr` 到 settings 对象。
+
+#### 6.41 加密备份里 `manifest.json` 必须**先写**再 tar（HIA-90 D5）
+
+**症状**：encrypted backup 创建成功，但 `restore_backup(dry_run=True)`
+立刻抛 `BackupRestoreError("no components to restore")`。
+
+**根因**：原来的流程是：
+
+```python
+# 1) 备份各 component
+manifest["components"][name] = comp.to_dict()
+
+# 2) 把整个 backup_dir tar 成 plain.tar，再加密成 backup.enc
+await self._pack_and_encrypt(backup_dir, component_objs)
+
+# 3) 在 backup_dir 下写 manifest.json  ← 太晚了！
+(backup_dir / "manifest.json").write_text(json.dumps(manifest))
+```
+
+encrypted 路径下，`manifest.json` 是 step 3 才写的，**不在** step 2 加密的 tarball 里。
+restore 时解密到 `staging/backup/manifest.json` — 不存在 → manifest=None
+→ `components = list(manifest.get("components", {}).keys())` 不执行 →
+`if not components: raise`。
+
+**修复**：写 manifest 必须在 `_pack_and_encrypt` **之前**。plain (unencrypted)
+模式无所谓 — manifest.json 留在 backup_dir 里给 `verify_backup` 用。encrypted
+模式把 manifest 跟着 tarball 一起加密，restore 时从 staging 解出来读。
+
+#### 6.42 staging 目录名用 `int(time.time())` 在快速重跑时冲突（HIA-90 D5）
+
+**症状**：`restore_backup` 用
+`staging = work_dir / f"restore_{backup_id}_{int(time.time())}"` 然后
+`staging.mkdir(parents=True, exist_ok=False)` — 同一秒内调用两次时
+第二次 `mkdir` 抛 `FileExistsError`。
+
+**根因**：测试里 DR drill 在 restore 之后又做一次 restore，时间戳秒级
+精度撞上。生产中也可能：同一 backup id 快速触发多次健康检查。
+
+**修复**：用微秒精度 + uuid 后缀：
+
+```python
+staging = self.work_dir / (
+    f"restore_{backup_id}_"
+    f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}_"
+    f"{uuid.uuid4().hex[:8]}"
+)
+```
+
+教训：磁盘路径里只要涉及 `mkdir(exist_ok=False)` / `open(mode='x')`
+/ `mkstemp`，timestamp 至少给到微秒 + 随机后缀。
+
 ---
 
 ## 7. 工具链 / 环境陷阱

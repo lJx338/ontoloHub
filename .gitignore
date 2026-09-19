@@ -89,6 +89,7 @@ data/uploads/
 data/runtime/
 data/cache/
 storage/
+apps/api/data/
 
 # ===== Logs =====
 logs/
@@ -115,3 +116,6 @@ postgres_data/
 # ===== Generated ontology artifacts =====
 exports/*.ttl.bak
 exports/*.owl.bak
+
+# ===== Cursor agent working files =====
+.cursor/
