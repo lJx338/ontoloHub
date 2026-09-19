@@ -236,6 +236,11 @@ from src.api.workflow import router as workflow_router, exec_router as workflow_
 app.include_router(workflow_router)
 app.include_router(workflow_exec_router)
 
+# HIA-74 D4: 版本化发布线（分支 / tag / merge audit）
+from src.api.release_line import router as release_line_router, merge_router as release_line_merge_router
+app.include_router(release_line_router)
+app.include_router(release_line_merge_router)
+
 
 @app.get("/api")
 async def api_root() -> dict:

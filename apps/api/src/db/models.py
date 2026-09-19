@@ -54,6 +54,12 @@ from .workflow import (
     WorkflowStepStatus,
     WorkflowStepType,
 )
+from .release_line import (
+    MergeStrategy,
+    OntologyBranch,
+    OntologyTag,
+    BranchMerge,
+)
 
 __all__ = [
     "Base",
@@ -146,4 +152,9 @@ __all__ = [
     "WorkflowExecutionStatus",
     "WorkflowStepStatus",
     "WorkflowStepType",
+    # Release line（HIA-74 D4）— branches / tags / merge audit
+    "MergeStrategy",
+    "OntologyBranch",
+    "OntologyTag",
+    "BranchMerge",
 ]
