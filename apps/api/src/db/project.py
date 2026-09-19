@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from .evidence import Source, Evidence
     from .mapping import MappingVersion
     from .release import ChangeRequest, Release
+    from .workspace import Workspace
 
 
 class ProjectStatus(str, Enum):
@@ -66,9 +67,23 @@ class Project(Base, UUIDMixin, TimestampMixin, SoftDeleteMixin):
         UUID(as_uuid=True), nullable=True
     )
 
+    # HIA-77 D1: optional workspace binding (multi-tenant).
+    # Nullable so legacy single-tenant projects keep working.
+    workspace_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     __table_args__ = (
         Index("ix_projects_status", "status"),
         Index("ix_projects_customer", "customer_id"),
+        Index("ix_projects_workspace", "workspace_id"),
+    )
+
+    workspace: Mapped[Optional["Workspace"]] = relationship(
+        "Workspace", back_populates="projects"
     )
 
     use_cases: Mapped[list["UseCase"]] = relationship(

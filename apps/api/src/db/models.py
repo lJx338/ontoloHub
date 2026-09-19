@@ -60,6 +60,13 @@ from .release_line import (
     OntologyTag,
     BranchMerge,
 )
+from .workspace import (
+    Workspace,
+    WorkspaceMembership,
+    WorkspacePlan,
+    WorkspaceRole,
+    workspace_has_role,
+)
 
 __all__ = [
     "Base",
@@ -157,4 +164,10 @@ __all__ = [
     "OntologyBranch",
     "OntologyTag",
     "BranchMerge",
+    # Workspace / multi-tenant（HIA-77 D1）
+    "Workspace",
+    "WorkspaceMembership",
+    "WorkspacePlan",
+    "WorkspaceRole",
+    "workspace_has_role",
 ]
