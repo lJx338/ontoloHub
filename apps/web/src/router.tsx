@@ -5,6 +5,7 @@ import { DashboardPage } from './pages/DashboardPage'
 import { ProjectsPage } from './pages/ProjectsPage'
 import { ProjectOverviewPage } from './pages/ProjectOverviewPage'
 import { EvidenceInboxPage } from './pages/EvidenceInboxPage'
+import { ReleasesPage } from './pages/ReleasesPage'
 
 export const router = createBrowserRouter([
   {
@@ -47,13 +48,7 @@ export const router = createBrowserRouter([
           },
           {
             path: 'changes',
-            element: (
-              <WorkbenchPlaceholder
-                title="变更 / 发布"
-                description="Change Request 工作流 + 发布线 + Preflight + Deployment。"
-                hia="HIA-65 (A17)"
-              />
-            ),
+            element: <ReleasesPage />,
           },
         ],
       },
