@@ -4,6 +4,7 @@ import { ProjectLayout, WorkbenchPlaceholder } from './components/ProjectLayout'
 import { DashboardPage } from './pages/DashboardPage'
 import { ProjectsPage } from './pages/ProjectsPage'
 import { ProjectOverviewPage } from './pages/ProjectOverviewPage'
+import { EvidenceInboxPage } from './pages/EvidenceInboxPage'
 
 export const router = createBrowserRouter([
   {
@@ -22,13 +23,7 @@ export const router = createBrowserRouter([
           { path: 'overview', element: <ProjectOverviewPage /> },
           {
             path: 'evidence',
-            element: (
-              <WorkbenchPlaceholder
-                title="证据收件箱"
-                description="CSV / XLSX / DB 抽样 → 字段剖析 → 候选映射。"
-                hia="HIA-60 (A15)"
-              />
-            ),
+            element: <EvidenceInboxPage />,
           },
           {
             path: 'ontology',
