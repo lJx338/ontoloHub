@@ -1,10 +1,10 @@
 import { createBrowserRouter, Navigate } from 'react-router-dom'
 import { Layout } from './components/Layout'
+import { ProjectLayout, WorkbenchPlaceholder } from './components/ProjectLayout'
 import { DashboardPage } from './pages/DashboardPage'
 import { ProjectsPage } from './pages/ProjectsPage'
-import { OntologiesPage } from './pages/OntologiesPage'
+import { ProjectOverviewPage } from './pages/ProjectOverviewPage'
 import { EvidenceInboxPage } from './pages/EvidenceInboxPage'
-import { ValidationPage } from './pages/ValidationPage'
 import { ReleasesPage } from './pages/ReleasesPage'
 
 export const router = createBrowserRouter([
@@ -14,10 +14,63 @@ export const router = createBrowserRouter([
     children: [
       { index: true, element: <DashboardPage /> },
       { path: 'projects', element: <ProjectsPage /> },
-      { path: 'ontologies', element: <OntologiesPage /> },
-      { path: 'evidence', element: <EvidenceInboxPage /> },
-      { path: 'validation', element: <ValidationPage /> },
-      { path: 'releases', element: <ReleasesPage /> },
+
+      // 项目工作台（A13 / HIA-63）：顶栏 + Tab + Outlet
+      {
+        path: 'projects/:projectId',
+        element: <ProjectLayout />,
+        children: [
+          { index: true, element: <Navigate to="overview" replace /> },
+          { path: 'overview', element: <ProjectOverviewPage /> },
+          {
+            path: 'evidence',
+            element: <EvidenceInboxPage />,
+          },
+          {
+            path: 'ontology',
+            element: (
+              <WorkbenchPlaceholder
+                title="本体编辑器"
+                description="类 / 属性 / 关系 / 约束的可视化建模与版本管理。"
+                hia="HIA-62 (A14)"
+              />
+            ),
+          },
+          {
+            path: 'verify',
+            element: (
+              <WorkbenchPlaceholder
+                title="验证"
+                description="用 SHACL 对 Object / 数据快照做合规校验，给出违规清单。"
+                hia="HIA-68 (A16)"
+              />
+            ),
+          },
+          {
+            path: 'changes',
+            element: <ReleasesPage />,
+          },
+        ],
+      },
+
+      // 老顶层路由保留作兼容入口（重定向到工作台首项）
+      {
+        path: 'evidence',
+        element: <Navigate to="/projects" replace />,
+      },
+      {
+        path: 'ontologies',
+        element: <Navigate to="/projects" replace />,
+      },
+      {
+        path: 'validation',
+        element: <Navigate to="/projects" replace />,
+      },
+      {
+        path: 'releases',
+        element: <Navigate to="/projects" replace />,
+      },
+
       { path: '*', element: <Navigate to="/" replace /> },
     ],
   },
