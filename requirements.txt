@@ -41,3 +41,9 @@ python-jose[cryptography]>=3.3.0  # HS256 JWT 签验签
 passlib[bcrypt]>=1.7.4            # bcrypt 密码哈希
 bcrypt>=4.0.0,<5.0                # passlib 1.7.x 兼容范围
 email-validator>=2.0.0            # Pydantic EmailStr 验证
+
+# ===== Function sandbox (HIA-78 C2) =====
+RestrictedPython>=8.0             # Python AST 解析（编译期检查，不做运行时限制）
+
+# ===== Webhook / Trigger integration (HIA-75 C3) =====
+APScheduler>=3.10.0               # Cron-based schedule trigger execution

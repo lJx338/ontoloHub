@@ -36,6 +36,43 @@ from .release import (
 from .governance import PluginInstallation, AuditEvent, DriftProposal, HealthSnapshot
 from .identity import User, Membership, GlobalRole, Role, has_role, ApiKey
 from .connector import Connector, ConnectorType, ConnectorStatus
+from .webhook import (
+    WebhookConfig,
+    WebhookDelivery,
+    WebhookEventType,
+    WebhookDeliveryStatus,
+    TriggerConfig,
+    TriggerType,
+    TriggerStatus,
+)
+from .workflow import (
+    Workflow,
+    WorkflowExecution,
+    WorkflowStepResult,
+    WorkflowStatus,
+    WorkflowExecutionStatus,
+    WorkflowStepStatus,
+    WorkflowStepType,
+)
+from .release_line import (
+    MergeStrategy,
+    OntologyBranch,
+    OntologyTag,
+    BranchMerge,
+)
+from .workspace import (
+    Workspace,
+    WorkspaceMembership,
+    WorkspacePlan,
+    WorkspaceRole,
+    workspace_has_role,
+)
+from .sso import (
+    IdentityProvider,
+    SsoLoginSession,
+    SsoProtocol,
+    SsoProviderStatus,
+)
 
 __all__ = [
     "Base",
@@ -112,4 +149,36 @@ __all__ = [
     "Connector",
     "ConnectorType",
     "ConnectorStatus",
+    # Webhook/Trigger 框架（HIA-75 C3）
+    "WebhookConfig",
+    "WebhookDelivery",
+    "WebhookEventType",
+    "WebhookDeliveryStatus",
+    "TriggerConfig",
+    "TriggerType",
+    "TriggerStatus",
+    # Workflow 编排（HIA-76 C4）
+    "Workflow",
+    "WorkflowExecution",
+    "WorkflowStepResult",
+    "WorkflowStatus",
+    "WorkflowExecutionStatus",
+    "WorkflowStepStatus",
+    "WorkflowStepType",
+    # Release line（HIA-74 D4）— branches / tags / merge audit
+    "MergeStrategy",
+    "OntologyBranch",
+    "OntologyTag",
+    "BranchMerge",
+    # Workspace / multi-tenant（HIA-77 D1）
+    "Workspace",
+    "WorkspaceMembership",
+    "WorkspacePlan",
+    "WorkspaceRole",
+    "workspace_has_role",
+    # SSO / IdP（HIA-79 D2）
+    "IdentityProvider",
+    "SsoLoginSession",
+    "SsoProtocol",
+    "SsoProviderStatus",
 ]

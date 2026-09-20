@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy import create_engine
+from sqlalchemy.pool import NullPool
 from sqlalchemy.orm import sessionmaker
 
 from src.core.config import get_settings
@@ -32,7 +33,7 @@ def _build_async_engine():
             pool_size=s.database.pool_size,
             max_overflow=s.database.max_overflow,
         )
-    return create_async_engine(url, **kwargs)
+    return create_async_engine(url, poolclass=NullPool, **kwargs)
 
 
 async_engine = _build_async_engine()

@@ -904,6 +904,242 @@ async def isolated_app(tmp_path, monkeypatch):
   作为锚点**（双 anchor），避免编辑工具按"上一条内容"删半截。
 - CI 不强制编号连续；偶尔跳号没事，发现了再补一行说明。
 
+### 6.33 E2E 走通测试中发现的 API 契约偏差（HIA-66）
+
+E2E demo 测试（`tests/test_e2e_demo.py`）完整跑一遍产品主链路，发现了
+多个「schema 定义 ↔ 实际 API 行为」不匹配的问题，都是单元测试没覆盖到的。
+
+#### 6.33.1 `POST /releases/{id}/preflight` body 必须传 `environment` 字段
+
+**症状**：测试里直接 `POST /releases/releases/{id}/preflight` 不带 body，返回
+`422 {"detail":"Field required"}`。
+
+**原因**：`PreflightRunRequest` 定义了 `environment: str = Field(...)`，
+FastAPI 要求 body 里有这个字段（没有默认值）。
+
+**规避**：调 preflight 端点时，带 `json={"environment": "local"}`
+（或其他环境）作为 body；未来如果要支持无 body 调用，
+`environment` 需改成 `Optional[str] = Field(default="production")`。
+
+#### 6.33.2 `POST /releases/projects/{id}/deployments` — 不是 `/deployments/releases/{id}/deploy`
+
+**症状**：调用 `/deployments/releases/{release_id}/deploy` 返回 404。
+
+**原因**：部署路由是 `POST /projects/{project_id}/deployments`（在 release.py 里），
+request body 是 `DeploymentCreate`，包含 `release_id`、`environment` 等字段。
+
+**规避**：部署调用方式：
+```python
+r = await client.post(
+    f"/releases/projects/{project_id}/deployments",   # 注意：是 projects/{project_id}/deployments
+    json={"release_id": release_id, "environment": "local"},
+)
+```
+
+#### 6.33.3 `POST /objects/projects/{id}/objects` — `object_type` 必须是 enum 值，`name` 必填
+
+**症状**：传 `object_type: "Customer"`（自由字符串）和空 body 返回 422。
+
+**原因**：`ObjectCreate.object_type` 是 `ObjectType` 枚举，合法值只有
+`entity | event | activity | agent | place | document | other`；且 `name` 字段是必填的。
+
+**规避**：创建对象时：
+```python
+r = await client.post(
+    f"/objects/projects/{project_id}/objects",
+    json={
+        "object_type": "entity",   # 枚举值，不是自由字符串
+        "name": "Alice Chen",      # name 必填
+        "data": {"email": "alice@acme.test"},
+    },
+)
+```
+
+#### 6.33.4 `POST /validation/runs` — `project_id` 是 Query 参数，body 用 `target_type`/`target_id` 结构
+
+**症状**：用 `POST /validation/projects/{id}/runs`（path）返回 404；
+用 `POST /validation/runs` 传 `validation_type` 但模型字段不匹配抛 AttributeError。
+
+**原因**：验证运行创建端点的 `project_id` 是 Query 参数，不是路径参数；
+且 `ValidationRun` 模型用 `target_type`/`target_id`/`name` 字段，
+`ValidationRunCreate` 的字段名和模型字段名有映射关系。
+
+**规避**：创建验证运行的正确方式：
+```python
+r = await client.post(
+    "/validation/runs",
+    params={"project_id": project_id},    # Query 参数，不是 path
+    json={
+        "validation_type": "shacl",      # → 映射到 ValidationRun.name
+        "ontology_version_id": v2_id,    # → 映射到 target_type="ontology" + target_id
+        # 或 mapping_version_id 用于 mapping 类型
+    },
+)
+```
+
+#### 6.33.5 `execute_validation_run` — `ValidationStatus` 没有 `SKIPPED` 枚举值
+
+**症状**：`execute_validation_run` 里 `run.status = ValidationStatus.SKIPPED`
+抛 `AttributeError: 'ValidationStatus' has no attribute 'SKIPPED'`。
+
+**原因**：`ValidationStatus` 只有 `PENDING | RUNNING | PASSED | WARNING | FAILED | ERROR`。
+`WARNING` 用来表示"跳过了实际执行"的状态。
+
+**规避**：不要用 `SKIPPED`；用 `WARNING` 替代。
+
+#### 6.34 `from x import func` 让 `monkeypatch.setattr` 失效（HIA-79 D2）
+
+**症状**：测试用 `monkeypatch.setattr(sso_client_mod, "fetch_discovery", fake)`
+替换模块属性，运行时仍然调到原版（跑出去打真实 HTTP，CI 报 `ConnectError`）。
+
+**根因**：`sso.py` 的 `from src.services.sso_client import fetch_discovery` 把
+函数对象**绑定到 `sso.py` 模块自己的命名空间**。后续 `monkeypatch.setattr`
+只改的是 `sso_client_mod` 模块的属性，`sso.py` 那份绑定不受影响。
+
+**修复模板**：在被测代码里改成"导入模块、走模块属性访问"：
+
+```python
+# 错：monkeypatch 失效
+from src.services.sso_client import fetch_discovery, exchange_code_for_tokens
+await fetch_discovery(...)
+
+# 对：测试可以 stub
+from src.services import sso_client as sso_client_mod
+await sso_client_mod.fetch_discovery(...)
+```
+
+测试继续按原方式 patch：
+
+```python
+monkeypatch.setattr(sso_client_mod, "fetch_discovery", _fake_fetch_discovery)
+```
+
+**何时该用**：（a）外部 IO 的 stub（HTTP/SMTP/DB/SDK），（b）需要替成
+raise 触发错误路径，（c）需要断言是否被调用。**何时不用**：纯 helper
+（PKCE / URL builder / claim 提取）——这些测试直接 import 调用就好。
+
+#### 6.35 SQLite DateTime 列丢失 tz info — 比较前先 normalize（HIA-79 D2）
+
+**症状**：模型声明 `expires_at: Mapped[datetime] = mapped_column(
+DateTime(timezone=True), ...)`，写入 `datetime.now(timezone.utc)`，读出
+后 `self.expires_at < datetime.now(timezone.utc)` 抛
+`TypeError: can't compare offset-naive and offset-aware datetimes`。
+
+**根因**：SQLite 没有原生 timestamp with timezone，写入时 SQLite 层把
+tzinfo 剥掉；读出来是 naive datetime。PostgreSQL 不会这样，所以本地
+SQLite 测试通过、上 PG 才暴露，或反过来。
+
+**修复模板**：所有"时间比较"都通过一个 helper 走：
+
+```python
+@property
+def is_expired(self) -> bool:
+    from datetime import datetime, timezone
+    exp = self.expires_at
+    if exp.tzinfo is None:                          # SQLite 把 tz 丢了
+        exp = exp.replace(tzinfo=timezone.utc)
+    return exp < datetime.now(timezone.utc)
+```
+
+同样的模式适用于所有"`expires_at` / `valid_until` / `not_before`"类的
+业务时间字段。如果跨 dialect 都要正确，统一在 ORM 层 normalize 比每个
+调用方各自处理更稳。
+
+#### 6.36 `async_session_factory()` 不自动 commit（HIA-79 D2）
+
+**症状**：测试 fixture 里
+```python
+async with async_session_factory() as s:
+    row = (await s.execute(select(...))).scalar_one()
+    row.expires_at = past_datetime
+    await s.flush()                              # 只 flush 没 commit
+    state = row.state
+
+# 接着打下一个请求，期望读到修改后的值
+r = await client.get(f"/api/sso/callback?...&state={state}")
+assert r.status_code == 400                     # 实际返回 302
+```
+
+**根因**：`async with async_session_factory()` 退出时**不会自动 commit**。
+`flush()` 只把改动推到 connection 缓冲；事务没 commit，关闭时就回滚到
+上一次 commit 之后的快照。下一个请求看到的是修改前的值。
+
+**修复**：fixture 里手动 commit：
+
+```python
+async with async_session_factory() as s:
+    row = (await s.execute(...)).scalar_one()
+    row.expires_at = past_datetime
+    await s.flush()
+    await s.commit()                            # ← 必须
+    state = row.state
+```
+
+**对比**：FastAPI `Depends(get_session)` 会自动 commit（见
+`src/db/connection.py`），所以走 HTTP 路径的代码不用担心；后台 task /
+测试 / 脚本里自己开 session 的代码路径必须显式 commit。这条与
+§25.8（workflow executor owned-session）是同一根因的不同表现。
+
+#### 6.37 加密字段的"加密别名"会让测试断在奇怪的格子（HIA-79 D2）
+
+**症状**：测试期望 `body["config"]["client_secret"] == "***"`，但实际返
+回明文；又期望数据库里 `enc:v1:` 前缀存在，但实际什么前缀都没有。
+
+**根因**：默认 `secret_fields=["client_secret_enc"]`（"加密字段别名"），
+但 API 接收/返回的是 `client_secret`。结果：
+- 写入时：`config["client_secret"]` 是明文，`config["client_secret_enc"]`
+  不存在 → 没东西被加密；
+- 读取时：mask 在 `client_secret_enc` 上做 → `client_secret` 仍是明文。
+
+**最佳实践**：加密的字段名 = 用户写的字段名 = OIDC/SAML/LDAP 规范字段名。
+OIDC spec 的字段就叫 `client_secret`，不要硬造 `client_secret_enc` 别名
+——加一层名字混淆只会让 API/DB/前端 三方契约对不齐。
+
+```python
+# 错：别名导致 mask 和 encrypt 命中不同 key
+DEFAULT_OIDC_SECRET_FIELDS = ["client_secret_enc"]
+
+# 对：和 OIDC spec 字段名一致
+DEFAULT_OIDC_SECRET_FIELDS = ["client_secret"]
+```
+
+如果将来真的需要"明文 vs 加密"区分，靠字段值的 `enc:v1:` 前缀判别
+（`encrypt_value` 已经这样做了），不要再造一层字段别名。
+
+#### 6.38 open-redirect 防御要在 login 入口就 sanitize，不能只信 callback（HIA-79 D2）
+
+**症状**：`return_to=https://attacker.example/steal` 进到 login 接口；
+login 接口只把 `return_to` 原样存到 `SsoLoginSession.relay_state`；callback
+接口虽然会 `_validate_return_to` 替换为 `/`，但 `relay_state` 列里已经
+留了攻击者 URL，DB dump / 审计就能看到这个 URL。
+
+**修复**：在 login 入口就过一次 sanitizer：
+
+```python
+safe_relay_state = _validate_return_to(return_to)
+sso_session = SsoLoginSession(
+    ...
+    relay_state=safe_relay_state,
+    ...
+)
+```
+
+**原则**：任何"用户输入且会回显/落盘"的字段，sanitize 在**第一个**入
+口做，而不是依赖"后续每个使用点都会过滤"。后者每加一个 caller 就多
+一个漏点，前者一处搞定。
+
+#### 6.33.6 写 E2E 测试时：先走通，再打磨
+
+**经验**：写 E2E 测试的过程中发现了 4 个 API 契约 bug
+（见 §6.33.1–6.33.5），这些问题在单元测试里没有覆盖，
+因为单元测试用的是 mock/in-memory 数据，绕过了真实的 API 路由解析和 schema 校验。
+
+**教训**：
+1. **每个新端点**写一个走 ASGI transport 的集成测试（至少调一次完整 HTTP 往返）。
+2. 测试前先看 `ValidationRunCreate` 等 schema 的实际字段定义，不要按「看起来合理」
+   的字段名写请求。
+3. 发现 422 时，把 `r.text` 完整打印出来；FastAPI 的 `detail` 字段会准确告诉
+   你缺了什么字段和类型不匹配的原因。
 ---
 
 ## 7. 工具链 / 环境陷阱
@@ -1869,3 +2105,846 @@ async with session_factory() as s:
     await s.commit()  # ← 不要 flush
 ```
 
+---
+
+## 22. Webhook / Trigger 集成（HIA-75 / C3）
+
+Webhook 分两路：**Out**（主动发到外部 URL）和 **In**（外部 POST 进来触发）。
+两路都用 `trigger_config` + `action_type_id` 关联 ActionRun。
+
+### 22.1 模块边界
+
+- `apps/api/src/db/webhook.py` — `WebhookConfig` / `WebhookDelivery` / `TriggerConfig` ORM
+- `apps/api/src/services/webhook_dispatcher.py` — HMAC 签名 + 重试 + 内嵌处理
+- `apps/api/src/api/webhooks.py` — CRUD + 内嵌 webhook 接收端点
+- `apps/api/alembic/versions/2026_09_18_0007_webhook_trigger.py` — schema
+
+### 22.2 Out 端：HMAC-SHA256 + 指数退避重试
+
+每次发 webhook 构造签名头：
+
+```python
+timestamp = str(int(datetime.now(timezone.utc).timestamp()))
+signed_payload = f"{timestamp}.{body}"
+signature = hmac.new(secret.encode(), signed_payload.encode(), hashlib.sha256).hexdigest()
+headers = {
+    "Content-Type": "application/json",
+    "X-OntoloHub-Signature": f"sha256={signature}",
+    "X-OntoloHub-Timestamp": timestamp,
+    "User-Agent": "OntoloHub-Webhook/1.0",
+}
+```
+
+**接收端校验**：用 `replay-attack-safe` 顺序：
+1. 检查 `X-OntoloHub-Timestamp` 在 ±5 分钟内（防重放）
+2. 重算 `HMAC(secret, "{timestamp}.{body}")` 与 `X-OntoloHub-Signature` 比对
+3. `hmac.compare_digest` 防 timing attack
+
+### 22.3 重试策略 + 状态机
+
+`WebhookDelivery.status` 状态机：
+
+```
+PENDING ──HTTP 2xx──► SUCCESS (终态)
+   │
+   ├──HTTP 非 2xx/timeout──► RETRYING ──成功──► SUCCESS
+   │                              │
+   │                              └─attempt < retry_count──► RETRYING
+   │
+   └──attempt == retry_count──► DROPPED (终态)
+```
+
+退避：`asyncio.sleep(retry_delay * (2 ** (attempt - 1)))` — 1min / 2min / 4min。
+
+### 22.4 SQLite 存 UUID 是 32 字符 hex（无 dash）— 用 `.hex` 转换
+
+**症状**：`webhook_dispatcher.py` 用 raw SQL 写 `trigger_configs` 时，
+`UUID("...")` 直接传给 `:id` 绑定变量报 `ValueError: badly formed hexadecimal UUID string`。
+
+**原因**：SQLAlchemy 在 `Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))` 上
+**自动**用 `.hex` 存储；如果你绕过 ORM 用 `session.execute(_text("... WHERE id = :id"), {"id": some_uuid})`，
+aiosqlite 不会自动转换，传 `uuid.UUID` 对象会报类型错，传 str-with-dash 也会因为长度不对报 `badly formed`。
+
+**规避**：
+
+```python
+# ✅ 用 .hex 拿到 32 字符无 dash 的字符串
+session.execute(
+    _text("INSERT INTO trigger_configs (id, ...) VALUES (:id, ...)"),
+    {"id": matched_trigger_id.hex, ...}
+)
+
+# 读回来时反过来
+matched_trigger_id = uuid.UUID(row[0])  # row[0] 是 32 字符 hex
+```
+
+PG 上不存在这个问题（用 `uuid` 类型，自动接 `UUID` 对象）。SQLite + raw SQL
+混用时才需要 `.hex` 转换。
+
+### 22.5 内嵌 webhook 处理用 sync session 而非 async
+
+**症状**：`POST /api/webhooks/in/{token}` 测试里第一次触发就报
+`TriggerConfig token not found`，但其实 trigger 刚刚在同一个 HTTP 响应里创建成功。
+
+**原因**：FastAPI 异步 handler 的事务还没 commit（要等 `Depends(get_session)` 的
+get_session generator 退出），下游 `process_inbound_webhook` 已经起了一个
+**新的 async session**，看不到未提交的 INSERT。
+
+**规避**：内嵌 webhook 处理函数（`process_inbound_webhook`）**用 sync session**
+（`sync_session_factory`）而不是 async —— sync session 走的是另一个连接池，
+强制等当前 async 事务提交后才会发新查询。
+
+```python
+from src.db.connection import sync_session_factory
+from sqlalchemy import text as _text
+
+with sync_session_factory() as session:
+    row = session.execute(
+        _text("SELECT id, action_type_id, project_id, input_template "
+              "FROM trigger_configs "
+              "WHERE trigger_type = 'INBOUND_WEBHOOK' "
+              "  AND json_extract(trigger_config, '$.token') = :token"),
+        {"token": token},
+    ).first()
+```
+
+**反例**（不要照抄）：
+
+```python
+# ❌ async session 看到的是 isolation level 内的快照，
+# 触发器还没 commit 之前看不到
+async with async_session_factory() as s:
+    row = (await s.execute(select(TriggerConfig).where(...))).first()
+```
+
+### 22.6 Trigger input_template：`{{webhook.payload.xxx}}` 简单替换
+
+`_apply_template(template, context)` 是递归 dict / list 替换，只识别
+`{{var.path}}` 这种字符串模板；不识别分支 / 循环 / 表达式。
+
+```python
+# 示例
+input_template = {
+    "customer_email": "{{webhook.payload.email}}",
+    "metadata": {
+        "received_at": "{{webhook.received_at}}",
+        "headers": {
+            "user_agent": "{{webhook.headers.user-agent}}"
+        }
+    }
+}
+```
+
+**支持的上下文变量**（按 trigger 类型）：
+
+- **inbound_webhook**：`{{webhook.headers.xxx}}` / `{{webhook.payload.xxx}}` / `{{webhook.received_at}}`
+- **schedule**：`{{schedule.fired_at}}` / `{{schedule.cron}}`
+- **object_change**（计划）：`{{object.before}}` / `{{object.after}}` / `{{object.event_type}}`
+
+**未匹配的处理**：保留原字符串 `{{unknown.var}}` 不替换（不报错）；要业务侧
+校验时再用 `{{var}}` 检查结果是否含 `{`。
+
+### 22.7 cron 解析只支持基础 5 字段语法
+
+`_cron_matches` 实现简化的 cron 匹配，**只支持**：
+
+- `*` — 通配
+- `*/N` — 每 N 单位
+- 逗号分隔的列表 `1,3,5`
+- 精确值 `5`
+
+**不支持**：范围 `1-5`、L / W / # 扩展、时区处理、秒级 cron（仅 5 字段：`分 时 日 月 周`）。
+**周字段**：Sunday = 0（不是 7）。
+
+```python
+# 支持
+"*/5 * * * *"     # 每 5 分钟
+"0 9 * * 1-5"     # ❌ 不支持范围 — 当前实现会判错
+"0 9 * * 1,3,5"   # ✅ 周一周三周五 9 点
+```
+
+需要高级 cron 时换 apscheduler / `croniter` 库。
+
+### 22.8 Inbound webhook 接收端点无 auth — token 在 URL 里
+
+**设计**：`POST /api/webhooks/in/{token}` 是**公开端点**，没 `Authorization` header。
+鉴权完全靠 URL 中的 token：
+
+```python
+@trigger_router.post("/api/webhooks/in/{token}")
+async def receive_webhook(token: str, request: Request):
+    # 不走 require_role / get_current_user — 外部系统不会发这些 header
+    success, error, trigger_id = await process_inbound_webhook(token, payload, headers)
+```
+
+**安全要求**：
+
+- Token 用 `secrets.token_urlsafe(32)`（256 bit 熵），不要可枚举
+- token 泄漏 = 攻击者可触发你的 Function；考虑 rate limit + IP allowlist
+- 配置 trigger 时默认生成 token，用户也可指定（但**不要**复用旧 token）
+- 收到 404 时**统一**返 `"Token not found or trigger not active"`，
+不区分"token 不存在"和"trigger 暂停" — 防 enumeration
+
+### 22.9 UUID(as_uuid=True) 处理器在 dispatcher 必须先转
+
+**症状**：`WebhookConfig.project_id` 在 ORM 里是 `UUID(as_uuid=True)`，dispatcher
+用 `select(WebhookConfig).where(WebhookConfig.project_id == project_id)` 查
+的时候，传字符串 `project_id` 报 `ValueError`。
+
+**原因**：`UUID(as_uuid=True)` 列的处理器对绑定的字符串调用 `.hex`；如果传
+`uuid.UUID(...)` 对象本身，SQLAlchemy 会试图 `.hex` 一个 UUID 实例（UUID 没
+`hex`，但有 `.hex` 属性 → 返回 32 字符 hex），所以传 UUID 对象也能跑；如果
+传**带 dash 的字符串**，SQLAlchemy 会先解析再 .hex → 也 OK。
+
+**真正出错的是 SQLAlchemy 2.0 的 strict 类型检查** — 传 `str` 而不是 `UUID` 会抛
+`InvalidRequestError: expected UUID, got str`。
+
+**规避**：在 dispatcher 入口统一转：
+
+```python
+if isinstance(project_id, str):
+    project_id = uuid.UUID(project_id)
+```
+
+### 22.10 测试用例：清理未完成的 delivery task
+
+**症状**：`test_webhook_trigger.py` 跑完测试后，控制台报 `RuntimeError: Event loop is closed`
+或者 task `was destroyed but it is pending!`。
+
+**原因**：`dispatch_webhook` 用 `asyncio.create_task(_deliver_with_retry(...))` fire-and-forget，
+测试 fixture 退出后 ASGITransport 关闭 event loop，但 task 还在 sleep / retry 中。
+
+**规避**（测试 fixture 里）：
+
+```python
+@pytest_asyncio.fixture
+async def isolated_app(...):
+    async with AsyncClient(...) as client:
+        yield client
+    # 等待所有 webhook delivery task 结束
+    pending = [t for t in asyncio.all_tasks() if not t.done() and "_deliver_with_retry" in str(t)]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+```
+
+或者在 production webhook URL 用 `[http://localhost:0/never-resolve]` 等极快失败的
+URL，避免测试卡在 sleep / retry 循环。
+
+---
+
+## 23. Function 沙箱执行器（HIA-78 / C2）
+
+HIA-78 实现 Python / JS Function 的 subprocess 沙箱执行。真正的安全边界是
+**subprocess + timeout + (Unix) rlimit**；AST 限制**不做**（RestrictedPython
+会引入过多兼容性问题，收益不抵复杂度）。
+
+### 23.1 模块边界
+
+- `apps/api/src/runtime/sandbox.py` — `execute_python()` / `execute_javascript()`
+- `apps/api/src/runtime/result.py` — `SandboxResult` / `SandboxError`
+- 子进程通过 stdin/stdout 协议与主进程通信（见 §23.5）
+
+### 23.2 资源限制矩阵
+
+| 限制项 | Unix 实现 | Windows 实现 |
+|---|---|---|
+| Wall-clock timeout | `subprocess.run(timeout=N)` | `subprocess.run(timeout=N)` |
+| CPU time | `resource.RLIMIT_CPU` | ❌（靠 timeout 兜底） |
+| Memory (地址空间) | `resource.RLIMIT_AS` | ❌（靠 timeout 兜底） |
+| 文件描述符 | `resource.RLIMIT_NOFILE` | ❌ |
+| 输出大小 | stdout/stderr 截断 1MB | stdout/stderr 截断 1MB |
+| 阻止 fork | `prctl(PR_SET_NO_NEW_PRIVS=38, 1)` | ❌ |
+
+**Windows 上的妥协**：靠 timeout + 输出截断做兜底；用户可以写死循环 / 占满内存
+但 30s 后必被 kill。本机验证足够，生产 Linux 部署才完整生效。
+
+### 23.3 编译期只做 `ast.parse`，不做 RestrictedPython
+
+```python
+def validate_python_source(code: str) -> None:
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        raise SandboxError(kind="syntax", message=f"Syntax error: {exc.msg}")
+```
+
+**为什么不限制 import / getattr / `_` 开头属性**：
+
+- RestrictedPython 会强制覆盖 `__builtins__`，破坏 `print`、`len`、`json.dumps`
+  这些常用内置；用户 Function 90% 都不安全也不需要。
+- 真隔离靠 subprocess — 子进程崩了主进程没事，timeout 强制 kill。
+- 业务上要让用户能 `import json` / `import requests` 调外部 API。
+
+**真正需要隔离的**（如果出现）：
+
+- 文件系统访问 — 加 chroot / docker
+- 网络访问 — 加 network namespace
+- 资源配额持久生效 — Linux cgroup
+
+### 23.4 输入输出协议
+
+**主进程 → 子进程（stdin）**：
+
+```json
+{"input_data": {...}, "secrets": {...}, "timeout_s": 30}
+```
+
+**子进程 → 主进程（stdout）**：
+
+```
+[user print output, free-form]
+<<<RESULT>>>
+{"final": "result value", ...}
+<<<END>>>
+```
+
+**为什么用 marker 而不是只读 stdout 最后一行**：
+
+- 用户 `print("...")` 可能输出任意内容，最后一行不可靠
+- marker 让结果边界清晰；主进程抓 `<<<RESULT>>>...<<<END>>>` 区间
+- 用户代码最后必须赋值给 `result` 变量；runner 模板负责 `json.dumps(globals_dict["result"])`
+
+### 23.5 用户代码嵌入 runner 模板用 `repr` 双层转义
+
+```python
+def _build_runner_script(user_code: str) -> str:
+    embedded = repr(user_code)  # 'a = 1\\nresult = a + 1'
+    return _PYTHON_RUNNER.replace("USER_CODE_PLACEHOLDER", embedded)
+```
+
+`repr()` 把字符串转成合法 Python 字面量 —— 处理换行 / 引号 / 反斜杠不踩坑。
+**不要**用 f-string 拼接或 `"..." + code + "..."`，多行代码 + 单引号
+会立刻破坏语法。
+
+### 23.6 Node.js 24 在 Windows 上 stdin 触发 CSPRNG 断言
+
+**症状**：`execute_javascript()` 在 Windows + Node 24 上跑（哪怕最简单的代码）：
+```
+internal/crypto/random.js: ... Error: ... Failed to generate bytes
+```
+
+**原因**：Node 24 启动时 stdin pipe 触发 CSPRNG 初始化；某些 Windows 环境
+（特别是 git-bash / 容器内）默认 stdin 不可读。
+
+**规避**：`stdin=subprocess.DEVNULL` + 把 input 写到**临时文件**：
+
+```python
+input_fd, input_path = tempfile.mkstemp(suffix=".json", prefix="sandbox_js_in_")
+with os.fdopen(input_fd, "w") as f:
+    f.write(json.dumps({"input_data": input_data or {}}))
+
+sandbox_env["__HIA78_INPUT_PATH__"] = input_path
+
+proc = subprocess.run(
+    ["node", wrapper_path],
+    capture_output=True,
+    timeout=timeout,
+    stdin=subprocess.DEVNULL,  # ← 关键
+    env=sandbox_env,
+)
+```
+
+JS wrapper 脚本从 `process.env.__HIA78_INPUT_PATH__` 读 input。
+
+### 23.7 沙箱子进程环境变量白名单
+
+```python
+def _sandbox_env() -> dict:
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "USER": os.environ.get("USER", ""),
+        "SYSTEMROOT": os.environ.get("SYSTEMROOT", "C:\\Windows"),  # Windows 必须
+        "TEMP": os.environ.get("TEMP", ""),
+        "TMP": os.environ.get("TMP", ""),
+        "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "en_US.UTF-8"),
+        "PYTHONPATH": "",     # 禁掉外部包路径
+        "HIA78_SANDBOX": "1", # 标识
+    }
+```
+
+**关键点**：
+
+- **不**传 `SECRET_KEY` / `DATABASE_URL` / `JWT_SECRET` 等凭证到子进程
+- Windows 上 `SYSTEMROOT` 必传，否则很多 API（包括 subprocess）失败
+- `PYTHONPATH=""` 强制子进程用系统默认 Python 路径，不被宿主污染
+
+### 23.8 用户代码失败的 3 类异常
+
+```python
+# 1. 编译失败（语法错）
+SandboxError(kind="syntax", message="Syntax error: ...")
+
+# 2. 运行时异常（exec 阶段）
+#    子进程 sys.exit(1) 写 traceback 到 stderr，主进程原样抛回
+SandboxResult(exit_code=1, stderr="Traceback ...\nValueError: ...", ...)
+
+# 3. 超时
+SandboxError(kind="timeout", message=f"Execution exceeded {timeout}s timeout")
+```
+
+**ActionRun.status 映射**：
+
+- 1 / 2 → `ActionRunStatus.FAILED`（业务失败，error 字段记 stderr）
+- 3 → `ActionRunStatus.FAILED`，error 写 `timeout_ms={duration_ms}` 便于排查
+
+### 23.9 ActionRun.input_data JSON 序列化要稳定
+
+**症状**：函数 sandbox 拿到的 `input_data` 是 dict 但字段顺序变了，
+函数内 `assert input_data == {"a": 1, "b": 2}` 失败。
+
+**原因**：SQLAlchemy 把 `Mapped[dict] = mapped_column(JSON)` 的 JSON 列
+反序列化时按入库时的 JSON 字符串还原；如果入库是 `json.dumps(data, sort_keys=False)`，
+反序列化后字段顺序就是入库顺序。
+
+**规避**：写入 ActionRun 时统一 `json.dumps(input_data, sort_keys=True)`，或
+让用户函数按 key 取值而不是 assert dict literal。
+
+### 23.10 sandbox 测试要跳 Windows-only 的子进程路径
+
+**症状**：CI 跑 sandbox 测试全过，本地 Windows 跑 `subprocess.run([sys.executable, tmp_path], ...)`
+挂起或超时。
+
+**原因**：本机 Python 安装了某些包带 debugger（pydevd）会卡 subprocess。
+
+**规避**：测试前 `pip uninstall pydevd pydevd-pycharm` 或者用
+`subprocess.run([sys.executable, "-S", tmp_path], ...)`（`-S` 不加载 site）。
+
+---
+
+## 24. 通用避坑（跨任务总结）
+
+### 24.1 UUID(as_uuid=True) 在 SQLite 上的存储行为
+
+`Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))` 在 SQLite 里
+**默认存 32 字符 hex（无 dash）**；UUID 类型本身变成 `CHAR(32)`。这一点
+和 PostgreSQL `uuid` 类型存 `xxxxxxxx-xxxx-...` 字符串**不一致**。
+
+**踩坑位置**：
+
+1. **Alembic 迁移**：SQLite 表 schema 里看到的是 `CHAR(32)`，迁移到 PG
+   时要 `op.alter_column` 改类型；或者一开始就不要手动写 schema 让 autogenerate 来。
+2. **Raw SQL**：绕过 ORM 用 `session.execute(_text(...))` 时，绑定
+   `uuid.UUID(...)` 对象 — aiosqlite 上**不会**自动 `.hex`，必须手动 `id.hex`。
+3. **跨 dialect 测试**：PG 测试和 SQLite 测试都跑 — 任意一边 fail 都是
+   dialect 差异问题。
+
+### 24.2 HTTP 端点的 tag 顺序与 OpenAPI
+
+FastAPI 按**装饰器注册顺序**生成 OpenAPI `paths` 字典，顺序与 `tags` 显示
+无关 — tags 是按字母排序聚合。如果想让 `/api/webhooks/in/{token}` 出现在
+"Triggers" 而非 "Webhooks" tag 下，**必须**用不同的 `APIRouter` 实例
+（`trigger_router = APIRouter(tags=["Triggers"])`），不要想靠 `@router.post`
+覆盖 tag。
+
+### 24.3 测试用 fake URL 触发 webhook，端口要空闲
+
+**症状**：`test_webhook_dispatch` 用 `http://127.0.0.1:9999/hook` 测试，
+本机端口被占用，httpx 报 `ConnectError`，但测试还跑通了（因为 dispatcher
+catch 后只记 `failed_deliveries`，不影响主流程）。
+
+**规避**：测试里启动一个真正的 aiohttp / uvicorn mock server：
+
+```python
+import aiohttp
+from aiohttp import web
+
+received_payloads = []
+
+async def hook(request):
+    payload = await request.json()
+    received_payloads.append(payload)
+    return web.Response(text="ok")
+
+app = web.Application()
+app.router.add_post("/hook", hook)
+
+@pytest_asyncio.fixture
+async def webhook_server():
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)  # 端口 0 = 让系统分配
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    yield f"http://127.0.0.1:{port}/hook"
+    await runner.cleanup()
+```
+
+不要 hardcode 固定端口；本机 CI / 多测试并行跑都会冲突。
+
+### 24.4 异步 fire-and-forget task 要保留 ref 到测试结束
+
+```python
+# ❌ task 失去引用，GC 可能在中间干掉
+asyncio.create_task(_deliver_with_retry(...))
+
+# ✅ 保留 ref（模块级 list 或 instance attribute）
+_DISPATCH_TASKS: set[asyncio.Task] = set()
+
+def fire_delivery(...):
+    task = asyncio.create_task(_deliver_with_retry(...))
+    _DISPATCH_TASKS.add(task)
+    task.add_done_callback(_DISPATCH_TASKS.discard)
+```
+
+production OK（loop 一直跑），测试会爆 `Task was destroyed but it is pending`。
+HIA-75 webhook dispatcher 已用 `await asyncio.gather(*tasks, return_exceptions=True)`
+但 fire-and-forget 路径上仍要保留 ref 防止 GC。
+
+### 24.5 SQLite 上 JSON 列查询的代价
+
+`WHERE json_extract(trigger_config, '$.token') = :token` 在 SQLite 上
+**全表扫描**（json path 上无索引）；生产 PG 上可加 GIN 索引。
+
+如果 trigger_configs 表会很大（>10K 行），dispatcher 入口要加 LRU 缓存：
+
+```python
+from functools import lru_cache
+import asyncio
+
+@lru_cache(maxsize=1024)
+def _cached_token_lookup(token: str) -> Optional[str]:
+    # 注意：sync 函数不能直接 await；改成 async + 自建 cache
+    ...
+```
+
+实际生产方案：dispatcher 启动时把 `token → trigger_id` 全量加载到内存 dict，
+token 增删时同步更新内存 map（监听 webhooks API 的 INSERT/DELETE）。
+
+### 24.6 Branch 命名：Linear 卡和 git 分支名必须严格匹配
+
+**症状**：上一步 HIA-78 提交到 `liaxiao23/hia-78-c2-...` 分支后，
+下一个任务 HIA-75 继续在同一分支写代码，commit 提交时分支名仍是 HIA-78。
+结果 HIA-75 的 commit 落在 HIA-78 分支上，git blame / log 全部串了。
+
+**规避**：每接新卡先 `git checkout -b liaxiao23/hia-XX-<name> <base>`，
+**base** 用上一个已 Done 的分支 HEAD（不一定是 main — 可能是栈式分支）。
+不要 `git checkout -b ... main` 然后 rebase —— 如果中间有别人的提交会冲突。
+
+**校验**：`git log --oneline | grep "HIA-75"` 看 commit 是否在正确的分支上。
+
+## 25. Workflow 编排（HIA-76 / C4）
+
+把多个 `ActionType` / `WebhookConfig` / object API / delay 串成顺序执行的有向无环图（当前仅顺序执行 + 跳步；并行/循环/条件分支在 backlog）。
+
+### 25.1 模块边界
+
+- `apps/api/src/db/workflow.py` — `Workflow` / `WorkflowExecution` / `WorkflowStepResult` ORM
+- `apps/api/src/runtime/workflow_step_handlers.py` — 4 种 step 类型的 handler
+- `apps/api/src/runtime/workflow_executor.py` — 顺序执行引擎
+- `apps/api/src/api/workflow.py` — CRUD + 执行端点
+- `apps/api/alembic/versions/2026_09_18_0008_workflow.py` — schema + trigger_configs.workflow_id
+
+### 25.2 Step 类型与字段
+
+| type | 必填 ref | 必填 config | 说明 |
+| --- | --- | --- | --- |
+| `function_call` | `ActionType.id` (kind=function) | 可选 `timeout_s` | 调沙箱执行 Python/JS 代码 |
+| `webhook_call`  | `WebhookConfig.id` | 可选 `timeout_s` | 按该 WebhookConfig 的 secret 重新算 HMAC 发 POST |
+| `object_api`    | `object_type_iri` 或 `step.ref` | 必填 `operation` (`create_object`/`update_object`/`create_link`) | 直接 mutate Object/Link 表 |
+| `delay`         | — | 必填 `seconds` (>=0) | `asyncio.sleep` |
+
+step dict 完整示例：
+
+```json
+{
+  "id": "send-email",
+  "name": "Send welcome email",
+  "type": "function_call",
+  "ref": "<action_type_id>",
+  "input_mapping": {"to": "$trigger.payload.email", "name": "$input.name"},
+  "config": {"timeout_s": 30},
+  "retry_policy": {"max_attempts": 3, "delay_s": 1},
+  "error_handler": "stop"
+}
+```
+
+`error_handler` 取值：
+- `"stop"`（默认）— step 失败 → execution FAILED
+- `"continue"` — 跳过失败，下一步继续
+- `{"goto_step": "step-3"}` — 跳到指定 step（之间所有 step 标记 SKIPPED）
+
+`retry_policy.max_attempts` 用指数退避 `delay_s * 2 ** (attempt-1)`。
+
+### 25.3 Context 传递：`$prev` / `$steps.<id>` / `$input` / `$trigger`
+
+每个 step 的输出都汇入同一个 context dict，下一个 step 通过 `input_mapping` 引用：
+
+```python
+{"to": "$prev.email"}                      # 上一步的整个 output
+{"value": "$steps.double.value"}            # 命名 step 的 output
+{"name": "$input.name"}                     # 用户调用 /execute 时传入的 input
+{"headers": "$trigger.webhook.headers"}     # trigger 上下文
+```
+
+`resolve_input_mapping()` 在 `src/runtime/workflow_step_handlers.py`：
+- 仅识别以 `$` 开头的 token；其他值原样保留
+- 字典递归；标量原样返回
+- 路径不存在的回退原占位符（不报错，便于模板调试）
+
+### 25.4 Trigger 集成（关键扩展点）
+
+`trigger_configs` 表加 `workflow_id` 列（nullable，FK → workflows.id）。
+触发器 API 现在要求 `action_type_id` 与 `workflow_id` **二选一**（model-level XOR validator）。
+
+`process_inbound_webhook` / `_fire_schedule_trigger` 在 dispatch 时：
+- `action_type_id` 非空 → 走原有 `ActionRun` 路径
+- `workflow_id` 非空 → 创建 `WorkflowExecution`，调用 `execute_workflow(id, trigger_kind="webhook"|"schedule")`
+
+**意味着 HIA-75 acceptance 用例**（"新客户注册 → 发邮件 → 同步 Salesforce → 创建跟进任务"）
+现在可以一步完成：定义一个 `kind="function"` 的 ActionType + 一个 `kind="webhook"` 的 WebhookConfig（Salesforce URL）+ 一个 `object_api` step，配成 Workflow，再用 inbound_webhook trigger 串起来。
+
+### 25.5 ⚠️ SQLite writer-lock + 同一 session 共享
+
+**症状**：HIA-76 第一版 `execute_workflow` 在 sync HTTP 路径下，每个 step 都
+`async with async_session_factory() as session` 打开新 session，结果：
+
+```
+sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) database is locked
+```
+
+**根因**：endpoint 的 session 还没 commit（外层事务持有写锁），
+executor 内部又开 session 写 `workflow_step_results` —— SQLite 序列化锁冲突。
+
+**修复**：
+- `execute_workflow(..., session=...)` 接受外部 session；sync HTTP 路径
+  把 `get_session()` 返回的 session 直接传进去，整个执行在一个事务里。
+- 调用方负责 `await session.commit()`（endpoint 已加）。
+- async background 路径不传 session，executor 自己 `async_session_factory()`
+  开新 session。
+
+**生产 PG 不踩**：PG 用 MVCC，跨 session 写不冲突。但即便如此，单事务也是
+最佳实践（一致性 + 减少 round-trip）。
+
+### 25.6 Background execution 在 ASGITransport 测试下不跑
+
+**症状**：`async_run=true` + `asyncio.create_task(execute_workflow(...))` 在
+`httpx.ASGITransport` 下 background task 不执行，execution 永远 PENDING。
+
+**根因**：ASGITransport 的 lifespan 关闭后 background tasks 不会被 drain。
+
+**验证**：用 `lifespan="on"` + `async with AsyncClient(...)` 跨多请求可触发
+background task（httpx 维护 ASGI app 生命周期）；或直接调 `execute_workflow`
+同步路径绕过。
+
+**生产**: `uvicorn` 跑的多 worker 进程下 background task 正常工作。
+
+### 25.7 验收脚本
+
+参见 `apps/api/tests/test_workflow.py`：CRUD + 顺序执行 + retry + continue
+handler + inbound_webhook trigger 集成，共 13 个用例。
+
+### 25.8 AsyncSession owned-session 必须显式 commit
+
+**症状**：executor 后台任务跑完后，DB 里 `execution.status` 还是 PENDING、
+`step_result` 行不存在；日志显示 executor 正常完成。
+
+**根因**：`async with async_session_factory() as session` 上下文退出时**不会
+自动 commit**。`session.flush()` 把改动推到 connection 缓冲区，但没
+`commit()` 的话退出时会回滚到上一次 commit 后的状态。
+
+**FastAPI `get_session` 依赖会代为 commit**（见 `src/db/connection.py`），
+但服务层/后台 task 自己 `async_session_factory() as session` 时没人替
+你 commit。
+
+**修复模板**：
+
+```python
+async def run_owned_session_work(execution_id: ...):
+    owns_session = session is None
+    if owns_session:
+        session = async_session_factory()
+    try:
+        ... # 业务逻辑 + session.flush()
+        if owns_session:
+            await session.commit()
+        return result
+    except Exception:
+        if owns_session and session is not None:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        if owns_session:
+            await session.__aexit__(None, None, None)
+```
+
+`workflow_executor.py::execute_workflow` 走的就是这个模式（owned_session
+分支），`async_run=true` 的 endpoint + webhook dispatcher 派发的后台 task
+都依赖它落盘；共享 session 路径（`/execute` sync 端点显式传 `session=`）
+由调用方 commit，executor 不重复 commit。
+
+### 25.9 后台 task 与手动 execute 的并发去重
+
+**症状**：`test_inbound_webhook_triggers_workflow` / `test_async_run_returns_pending`
+单独跑都通过；批量跑偶发 2 个 step_result 或 LookupError。
+
+**根因**：ASGITransport 下 §25.6 让 background task 是否执行变得不确定。
+在 race window 内可能：
+1. 测试 GET 读到的 status 还是 PENDING → 测试手动 `await execute_workflow`
+2. 但 background task 紧接着也跑了 → 两个 invocation 都写 step_result，
+   重复
+
+或反向：GET 看到 status=success 但其实 background task 的 commit 还没
+replication 完 → 测试手动调用查到 LookupError。
+
+**处理模式**（用在 ASGITransport 测试里）：
+
+```python
+# 1. 触发 webhook / async_run
+r = await client.post(...)
+
+# 2. 先 GET 一遍把 POST 的事务强制 commit + 拿到最新状态
+r = await client.get(f"/workflow-executions/{eid}")
+if r.json()["status"] in {"pending", "running"}:
+    # 3. 仅在尚未完成时手动驱动 executor
+    await execute_workflow(uuid.UUID(eid), ...)
+
+# 4. 断言 step_result 用 dedupe by step_id（容忍 0/1/2 行）
+sr = (await client.get(f"/workflow-executions/{eid}/step-results")).json()
+step_ids = {row["step_id"] for row in sr}
+assert expected_step_id in step_ids
+assert all(row["status"] == "success" for row in sr)
+```
+
+**注意**：批量测试仍有 CLAUDE.md 第 1 条记录的 `reinit_engines` 时序问题
+（LookupError 在第二个测试出现），与本 pitfall 无关，不要混在一起追。
+
+---
+
+## 26. SSO / Identity Provider（HIA-79 / D2）
+
+企业级 SSO 配置 + OIDC 授权码（PKCE）登录 + JIT 用户配置。SAML/LDAP
+在 D2 仅做 schema 占位（实际登录流留到 D2.x）。
+
+### 26.1 模块边界
+
+| 模块 | 职责 |
+| --- | --- |
+| `apps/api/src/db/sso.py` | `IdentityProvider`、`SsoLoginSession` ORM + `is_expired` helper |
+| `apps/api/src/services/sso_client.py` | OIDC discovery cache、JWKS cache、PKCE、auth URL builder、code→token、ID-token verify |
+| `apps/api/src/api/sso.py` | `provider_router`（CRUD + test）+ `login_router`（login/callback） |
+| `apps/api/alembic/versions/2026_09_19_0011_sso.py` | 两张表的迁移 |
+
+### 26.2 数据模型
+
+```python
+class IdentityProvider(Base, UUIDMixin, TimestampMixin):
+    workspace_id, name, protocol, status
+    config: JSON              # {"issuer_url", "client_id", "client_secret", ...}
+    claim_mapping: JSON       # {"email": "email", "display_name": "name"}
+    secret_fields: JSON       # ["client_secret"]
+    auto_provision: bool
+    force_sso: bool
+    last_test_status / message / at
+    created_by
+
+    __table_args__ = (UniqueConstraint("workspace_id", "protocol"), ...)
+```
+
+唯一约束 `uq_identity_providers_workspace_protocol` 让一个 workspace
+**每种协议最多一个 IdP**（要换 IdP 先 disable 旧的）。
+
+`SsoLoginSession` 跟踪 in-flight flow：`state`（CSRF）/ `nonce`（OIDC
+ID-token）/ `code_verifier`（PKCE）/ `redirect_uri` / `relay_state`
+（已 sanitize 过的 return_to）。10 分钟 TTL，`consumed_at` 标记单次
+使用。
+
+### 26.3 加密 / Mask 约定
+
+- **加密**：用 `src.core.secrets.encrypt_value`（Fernet，带 `enc:v1:` 前缀）。
+- **Mask**：API 返回前 `mask_secret_fields(config, idp.secret_fields)`，
+  把所有声明的 secret 字段替换成 `"***"`。
+- **默认 `secret_fields = ["client_secret"]`**：和 OIDC spec 字段名一致；
+  不要造 `client_secret_enc` 别名（详见 §6.37）。
+- **解密**：callback 里 `decrypt_value(plain_cfg[f])` 逐字段解；不在 DB
+  里直接读 secret 原文。
+
+### 26.4 OIDC 流程（RFC 6749 + RFC 7636 + OpenID Connect Core）
+
+```
+┌────────────┐    GET /api/sso/{slug}/login?return_to=...
+│  Browser   │ ─────────────────────────────────────────► Backend
+│            │ ◄─ 302 /api/sso/callback                   │
+│            │ ─► GET /authorize?...&code_challenge=...    │ IdP
+│            │ ◄─ 302 /api/sso/callback?code=...&state=... │
+│            │ ─► GET /api/sso/callback?...               │ Backend
+└────────────┘                                            │
+                                                          ▼
+                                                  token exchange
+                                                  ID-token verify
+                                                  JIT user
+                                                  JWT issued
+                                                  302 /return_to?token=...
+```
+
+**关键不变量**：
+
+1. `state` 单次使用 + 短期 TTL（10 min）—— callback 命中后立刻写
+   `consumed_at`，replay 会 400。
+2. `nonce` 在 ID-token 验证时强制比对，防重放。
+3. PKCE `code_verifier` 从未离开 server；authorize 请求只带
+   `code_challenge`（SHA-256(verifier)）。
+4. `relay_state` 在 login 入口就 sanitize 一次（§6.38），不再依赖
+   callback 兜底。
+
+### 26.5 API 契约
+
+| 端点 | 方法 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `/api/workspaces/{wid}/sso/providers` | `POST` | workspace ADMIN | 创建 IdP（自动 encrypt secret） |
+| 同上 | `GET` | workspace MEMBER+ | 列表（mask 后返回） |
+| `/api/workspaces/{wid}/sso/providers/{pid}` | `GET` / `PATCH` / `DELETE` | GET:MEMBER+ / PATCH,DELETE:ADMIN | 单个操作 |
+| `/api/workspaces/{wid}/sso/providers/{pid}/test` | `POST` | workspace ADMIN | test_connection：OIDC 跑 discovery |
+| `/api/sso/{slug}/login` | `GET` | 公开 | 302 → IdP authorize URL |
+| `/api/sso/callback` | `GET` | 公开 | IdP 回调入口；成功 → `return_to?token=...` |
+
+错误码：
+
+- `user_not_provisioned`：`auto_provision=false` + IdP 返回未知 email
+- `discovery_unreachable` / `discovery_failed` / `discovery_invalid_json`
+- `token_exchange_failed` / `id_token_invalid` / `id_token_nonce_mismatch`
+- 错误一律通过 redirect 的 query string 回传（`sso_error=...&sso_error_message=...`），
+  不会泄漏 secret / private key material。
+
+### 26.6 强制 SSO（force_sso）
+
+workspace 的 IdP 设 `force_sso=true` 时，callback 成功后**立刻清掉
+该用户的 `password_hash`**，让本地密码登录不可用。bootstrap admin
+（`admin@ontolohub.local`）豁免，用于恢复 tenant。
+
+注意：
+
+- 只清 **当前 workspace 的 IdP 登录过的用户**。用户在别的 workspace 没
+  走过 SSO 时不动。
+- 不影响其他认证方式（API Key / JWT access token 在有效期内仍可用，
+  直到 token 自然过期）。
+
+### 26.7 避坑
+
+- §6.34 `from x import func` 失效 — `sso.py` 通过 `sso_client_mod.X()`
+  调用 OIDC client，保证测试能 monkeypatch。
+- §6.35 SQLite DateTime 列丢 tz — `is_expired` 里 normalize 后比较。
+- §6.36 `async_session_factory()` 不自动 commit — 测试 fixture 改了
+  row 必须 `await s.commit()`。
+- §6.37 加密字段名 = OIDC spec 字段名 — 别名只会让契约对不齐。
+- §6.38 open-redirect 在 login 入口就 sanitize。
+
+### 26.8 测试覆盖清单
+
+参见 `apps/api/tests/test_sso.py`：
+
+- Provider CRUD（admin-only、secret 加密、mask、唯一性）
+- 工作空间隔离（非成员 404）
+- OIDC helper 单测（PKCE shape、auth URL builder）
+- 完整 callback flow（JIT 创 user、加入 workspace、issue JWT）
+- 安全负例：replay / expired / `auto_provision=false` / force_sso 清密码 /
+  外部 `return_to` sanitize
+
+共 19 个用例，全部走 ASGI transport + monkeypatch OIDC client，避免打
+真实 IdP。
+
+## 工具链 / 环境陷阱
