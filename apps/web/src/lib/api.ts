@@ -199,4 +199,39 @@ export const api = {
       `/projects/${projectId}/audit`,
       { params: { limit } },
     ),
+
+  // Verification — HIA-68
+  listProjectValidationRuns: (
+    projectId: string,
+    limit?: number,
+  ) =>
+    request<import('./types').ValidationRun[]>('/validation/runs', {
+      params: { project_id: projectId, limit },
+    }),
+  getValidationRun: (runId: string) =>
+    request<import('./types').ValidationRunDetail>(
+      `/validation/runs/${runId}`,
+    ),
+  createValidationRun: (
+    projectId: string,
+    input: import('./types').ValidationRunCreateInput,
+  ) =>
+    request<import('./types').ValidationRun>('/validation/runs', {
+      method: 'POST',
+      params: { project_id: projectId },
+      body: JSON.stringify(input),
+    }),
+  executeValidationRun: (runId: string) =>
+    request<import('./types').ValidationRunDetail>(
+      `/validation/runs/${runId}/execute`,
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
+  saveValidationRunAsQuery: (
+    runId: string,
+    input: { name: string; description?: string; use_case?: string },
+  ) =>
+    request<import('./types').SavedQuery>(
+      `/validation/runs/${runId}/save-as-query`,
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
 }

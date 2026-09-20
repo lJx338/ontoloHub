@@ -273,3 +273,76 @@ export interface AuditEvent {
   created_at: string
   notes?: string | null
 }
+
+// ===== Verification / Validation (HIA-68) =====
+
+export type ValidationStatus =
+  | 'PENDING'
+  | 'RUNNING'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'CANCELLED'
+
+export interface ValidationRun {
+  id: string
+  project_id: string
+  validation_type: string
+  status: ValidationStatus
+  total_tests: number
+  passed_tests: number
+  failed_tests: number
+  skipped_tests: number
+  duration_ms?: number | null
+  started_at?: string | null
+  completed_at?: string | null
+  created_at: string
+}
+
+export interface SHACLViolation {
+  focus_node?: string
+  path?: string
+  message?: string
+  severity?: string
+  value?: unknown
+  source_shape?: string
+}
+
+export interface ValidationRunDetail {
+  id: string
+  project_id: string
+  name: string
+  description?: string | null
+  validation_type: string
+  status: ValidationStatus
+  total_checks: number
+  passed_checks: number
+  warning_checks: number
+  failed_checks: number
+  violations?: SHACLViolation[] | null
+  report_summary?: Record<string, unknown> | null
+  started_at?: string | null
+  completed_at?: string | null
+  duration_ms?: number | null
+  triggered_by?: string | null
+  created_by?: string | null
+  created_at: string
+}
+
+export interface ValidationRunCreateInput {
+  validation_type: string
+  ontology_version_id?: string
+  mapping_version_id?: string
+  config?: Record<string, unknown>
+}
+
+export interface SavedQuery {
+  id: string
+  project_id: string
+  name: string
+  description?: string | null
+  is_shared: boolean
+  run_count: number
+  last_run_at?: string | null
+  created_by?: string | null
+  created_at: string
+}

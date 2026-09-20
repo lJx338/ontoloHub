@@ -6,6 +6,7 @@ import { ProjectsPage } from './pages/ProjectsPage'
 import { ProjectOverviewPage } from './pages/ProjectOverviewPage'
 import { EvidenceInboxPage } from './pages/EvidenceInboxPage'
 import { ReleasesPage } from './pages/ReleasesPage'
+import { VerificationPage } from './pages/VerificationPage'
 
 export const router = createBrowserRouter([
   {
@@ -38,13 +39,7 @@ export const router = createBrowserRouter([
           },
           {
             path: 'verify',
-            element: (
-              <WorkbenchPlaceholder
-                title="验证"
-                description="用 SHACL 对 Object / 数据快照做合规校验，给出违规清单。"
-                hia="HIA-68 (A16)"
-              />
-            ),
+            element: <VerificationPage />,
           },
           {
             path: 'changes',
