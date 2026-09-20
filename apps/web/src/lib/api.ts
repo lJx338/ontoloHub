@@ -234,4 +234,123 @@ export const api = {
       `/validation/runs/${runId}/save-as-query`,
       { method: 'POST', body: JSON.stringify(input) },
     ),
+
+  // Ontology — HIA-62
+  listOntologyClasses: (ontologyId: string) =>
+    request<import('./types').OntologyClass[]>(
+      `/ontologies/${ontologyId}/classes`,
+    ),
+  createOntologyClass: (
+    ontologyId: string,
+    input: {
+      name: string
+      iri: string
+      local_name?: string
+      class_type?: import('./types').ClassType
+      parent_iri?: string
+      description?: string
+      definition?: string
+    },
+  ) =>
+    request<import('./types').OntologyClass>(
+      `/ontologies/${ontologyId}/classes`,
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+  updateOntologyClass: (
+    ontologyId: string,
+    classId: string,
+    input: Partial<{
+      name: string
+      local_name: string
+      description: string
+      definition: string
+    }>,
+  ) =>
+    request<import('./types').OntologyClass>(
+      `/ontologies/${ontologyId}/classes/${classId}`,
+      { method: 'PATCH', body: JSON.stringify(input) },
+    ),
+  deleteOntologyClass: (ontologyId: string, classId: string) =>
+    request<void>(`/ontologies/${ontologyId}/classes/${classId}`, {
+      method: 'DELETE',
+    }),
+
+  listOntologyProperties: (ontologyId: string) =>
+    request<import('./types').OntologyProperty[]>(
+      `/ontologies/${ontologyId}/properties`,
+    ),
+  createOntologyProperty: (
+    ontologyId: string,
+    input: {
+      name: string
+      iri: string
+      property_type?: import('./types').PropertyType
+      domain_iri?: string
+      range_type?: string
+      range_class_iri?: string
+      description?: string
+      unit?: string
+      is_required?: boolean
+      is_multivalued?: boolean
+    },
+  ) =>
+    request<import('./types').OntologyProperty>(
+      `/ontologies/${ontologyId}/properties`,
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+  updateOntologyProperty: (
+    ontologyId: string,
+    propertyId: string,
+    input: Partial<{
+      name: string
+      local_name: string
+      description: string
+      unit: string
+    }>,
+  ) =>
+    request<import('./types').OntologyProperty>(
+      `/ontologies/${ontologyId}/properties/${propertyId}`,
+      { method: 'PATCH', body: JSON.stringify(input) },
+    ),
+  deleteOntologyProperty: (ontologyId: string, propertyId: string) =>
+    request<void>(`/ontologies/${ontologyId}/properties/${propertyId}`, {
+      method: 'DELETE',
+    }),
+
+  listOntologyRelations: (ontologyId: string) =>
+    request<import('./types').OntologyRelation[]>(
+      `/ontologies/${ontologyId}/relations`,
+    ),
+
+  listOntologyVersions: (ontologyId: string) =>
+    request<import('./types').OntologyVersion[]>(
+      `/ontologies/${ontologyId}/versions`,
+    ),
+  publishOntology: (ontologyId: string) =>
+    request<import('./types').PublishResult>(
+      `/ontologies/${ontologyId}/publish`,
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
+  forkOntology: (
+    ontologyId: string,
+    input?: { new_name?: string; new_namespace?: string },
+  ) =>
+    request<import('./types').ForkResult>(`/ontologies/${ontologyId}/fork`, {
+      method: 'POST',
+      body: JSON.stringify(input ?? {}),
+    }),
+  diffOntology: (
+    ontologyId: string,
+    fromVersionId: string,
+    toVersionId: string,
+  ) =>
+    request<import('./types').OntologyDiff>(
+      `/ontologies/${ontologyId}/diff`,
+      {
+        params: {
+          from_version_id: fromVersionId,
+          to_version_id: toVersionId,
+        },
+      },
+    ),
 }
