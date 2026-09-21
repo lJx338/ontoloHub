@@ -1,11 +1,13 @@
 import { createBrowserRouter, Navigate } from 'react-router-dom'
 import { Layout } from './components/Layout'
-import { ProjectLayout, WorkbenchPlaceholder } from './components/ProjectLayout'
+import { ProjectLayout } from './components/ProjectLayout'
 import { DashboardPage } from './pages/DashboardPage'
 import { ProjectsPage } from './pages/ProjectsPage'
 import { ProjectOverviewPage } from './pages/ProjectOverviewPage'
 import { EvidenceInboxPage } from './pages/EvidenceInboxPage'
 import { ReleasesPage } from './pages/ReleasesPage'
+import { VerificationPage } from './pages/VerificationPage'
+import { OntologyEditorPage } from './pages/OntologyEditorPage'
 
 export const router = createBrowserRouter([
   {
@@ -28,23 +30,11 @@ export const router = createBrowserRouter([
           },
           {
             path: 'ontology',
-            element: (
-              <WorkbenchPlaceholder
-                title="本体编辑器"
-                description="类 / 属性 / 关系 / 约束的可视化建模与版本管理。"
-                hia="HIA-62 (A14)"
-              />
-            ),
+            element: <OntologyEditorPage />,
           },
           {
             path: 'verify',
-            element: (
-              <WorkbenchPlaceholder
-                title="验证"
-                description="用 SHACL 对 Object / 数据快照做合规校验，给出违规清单。"
-                hia="HIA-68 (A16)"
-              />
-            ),
+            element: <VerificationPage />,
           },
           {
             path: 'changes',
