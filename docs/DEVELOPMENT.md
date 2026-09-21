@@ -1140,7 +1140,6 @@ sso_session = SsoLoginSession(
    的字段名写请求。
 3. 发现 422 时，把 `r.text` 完整打印出来；FastAPI 的 `detail` 字段会准确告诉
    你缺了什么字段和类型不匹配的原因。
-
 ---
 
 ## 7. 工具链 / 环境陷阱
@@ -2948,5 +2947,4 @@ workspace 的 IdP 设 `force_sso=true` 时，callback 成功后**立刻清掉
 共 19 个用例，全部走 ASGI transport + monkeypatch OIDC client，避免打
 真实 IdP。
 
-
-
+## 工具链 / 环境陷阱
